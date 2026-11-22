@@ -3,6 +3,7 @@ import base64
 import hashlib
 import hmac
 from html import escape
+from ipaddress import IPv6Address
 import logging
 import os
 from pathlib import Path
@@ -60,11 +61,17 @@ LABELS = {
 }
 
 
+class UnknownHostKey(paramiko.SSHException):
+    pass
+
+
 class HostPin(paramiko.MissingHostKeyPolicy):
     def __init__(self, expected):
         self.expected = expected
 
     def missing_host_key(self, client, hostname, key):
+        if self.expected is None:
+            raise UnknownHostKey
         digest = hashlib.sha256(key.asbytes()).digest()
         actual = "SHA256:" + base64.b64encode(digest).decode().rstrip("=")
         if not hmac.compare_digest(actual, self.expected):
@@ -75,6 +82,8 @@ def connect(host, port, username, fingerprint, password=None):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(HostPin(fingerprint))
     try:
+        if fingerprint is None:
+            client.load_system_host_keys()
         client.connect(
             host, port=port, username=username, password=password,
             key_filename=os.getenv("SSH_KEY_PATH") if password is None else None,
@@ -209,7 +218,7 @@ async def select(update, context):
     clear(context)
     context.user_data["action"] = query.data
     await query.message.reply_text(
-        "در سه خط، آدرس سرور، نام کاربر و اثرانگشت SSH را بفرست. "
+        "آی‌پی یا آدرس سرور را بفرست. "
         "برای پورت سفارشی از host:port یا [IPv6]:port استفاده کن.",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بازگشت", callback_data="cancel")]]),
     )
@@ -224,15 +233,24 @@ async def cancel(update, context):
     await update.effective_message.reply_text("اتصال بسته شد. عملیات بعدی را انتخاب کن.", reply_markup=menu())
 
 
-def parse_target(value):
-    host, user, fingerprint = (line.strip() for line in value.strip().splitlines())
+def parse_address(value):
+    host = value.strip()
+    if ":" in host and not host.startswith("[") and host.count(":") > 1:
+        return str(IPv6Address(host)), 22
     match = re.fullmatch(r"(?:\[([0-9a-fA-F:.]+)\]|([a-zA-Z0-9_.-]+))(?::([0-9]{1,5}))?", host)
-    if not match or not re.fullmatch(r"[A-Za-z0-9_.-]+", user):
+    if not match:
         raise ValueError
     port = int(match[3] or 22)
-    if not 1 <= port <= 65535 or not re.fullmatch(r"SHA256:[A-Za-z0-9+/]{43}", fingerprint):
+    if not 1 <= port <= 65535:
         raise ValueError
-    return match[1] or match[2], port, user, fingerprint
+    return str(IPv6Address(match[1])) if match[1] else match[2], port
+
+
+async def ask_password(message):
+    prompt = "رمز SSH را بفرست. ربات تلاش می‌کند پیام رمز را پس از دریافت حذف کند."
+    if os.getenv("SSH_KEY_PATH"):
+        prompt += " برای ورود با کلید تنظیم‌شده، یک نقطه (.) بفرست."
+    await message.reply_text(prompt + " گفت‌وگو با ربات تلگرام رمزنگاری سرتاسری ندارد.")
 
 
 async def send_code(message, value, copy=False):
@@ -246,7 +264,7 @@ async def send_code(message, value, copy=False):
 
 async def operate(message, state, client, command=None):
     action = state["action"]
-    sudo = "" if state["target"][2] == "root" else "sudo -n "
+    sudo = "" if state["username"] == "root" else "sudo -n "
     if action == "node":
         await message.reply_text("نصب شروع شد. این مرحله ممکن است چند دقیقه طول بکشد.")
         status, data = await asyncio.to_thread(install_node, client, sudo)
@@ -281,30 +299,50 @@ async def handle_text(update, context):
         clear(context)
         await message.reply_text("مهلت اتصال تمام شد.", reply_markup=menu())
         return
-    if "target" not in state:
+    if "address" not in state:
         try:
-            state["target"] = parse_target(message.text)
+            state["address"] = parse_address(message.text)
         except ValueError:
-            await message.reply_text("قالب ورودی معتبر نیست. سه خط بفرست: host:port، نام کاربر و SHA256:…")
+            await message.reply_text("آدرس معتبر نیست. آی‌پی، نام میزبان یا آدرس به‌همراه پورت را بفرست.")
             return
-        await message.reply_text(
-            "برای کلید SSH تنظیم‌شده روی میزبان ربات، یک نقطه (.) بفرست. "
-            "برای احراز هویت با رمز، رمز را بفرست. پیام رمز پس از دریافت حذف می‌شود. "
-            "گفت‌وگو با ربات تلگرام رمزنگاری سرتاسری ندارد."
-        )
+        await message.reply_text("نام کاربری SSH را بفرست. مثلاً root یا ubuntu.")
+        return
+    if "username" not in state:
+        username = message.text.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", username):
+            await message.reply_text("نام کاربری معتبر نیست. دوباره بفرست.")
+            return
+        state["username"] = username
+        await ask_password(message)
+        return
+    if state.get("awaiting_fingerprint"):
+        fingerprint = message.text.strip()
+        if not re.fullmatch(r"SHA256:[A-Za-z0-9+/]{43}", fingerprint):
+            await message.reply_text("اثرانگشت SSH را در قالب SHA256:… بفرست.")
+            return
+        state["fingerprint"] = fingerprint
+        state.pop("awaiting_fingerprint")
+        await ask_password(message)
         return
     if "client" not in state:
-        password = None if message.text == "." else message.text
-        if password is None and not os.getenv("SSH_KEY_PATH"):
-            await message.reply_text("مسیر کلید SSH روی میزبان ربات تنظیم نشده است.")
-            return
+        use_key = message.text == "." and os.getenv("SSH_KEY_PATH")
+        password = None if use_key else message.text
         if password is not None:
             try:
                 await message.delete()
             except TelegramError:
                 await message.reply_text("حذف پیام رمز ناموفق بود. پیام را دستی حذف کن.")
         try:
-            client = await asyncio.to_thread(connect, *state["target"], password)
+            client = await asyncio.to_thread(
+                connect, *state["address"], state["username"], state.get("fingerprint"), password,
+            )
+        except UnknownHostKey:
+            state["awaiting_fingerprint"] = True
+            await message.reply_text(
+                "کلید این سرور روی میزبان ربات ثبت نشده است. اثرانگشت SHA256 را "
+                "از کنسول مورد اعتماد VPS بگیر و بفرست. بعد رمز را دوباره می‌پرسم."
+            )
+            return
         except (OSError, paramiko.SSHException, ValueError):
             await message.reply_text("اتصال برقرار نشد. اثرانگشت، دسترسی و اطلاعات ورود را بررسی کن. برای تغییر سرور /cancel را بزن.")
             return
