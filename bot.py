@@ -1,7 +1,4 @@
 import asyncio
-import base64
-import hashlib
-import hmac
 from html import escape
 from ipaddress import IPv6Address
 import logging
@@ -10,6 +7,7 @@ from pathlib import Path
 import re
 import shlex
 import subprocess
+import tempfile
 import time
 
 import paramiko
@@ -61,35 +59,36 @@ LABELS = {
 }
 
 
-class UnknownHostKey(paramiko.SSHException):
-    pass
-
-
-class HostPin(paramiko.MissingHostKeyPolicy):
-    def __init__(self, expected):
-        self.expected = expected
-
-    def missing_host_key(self, client, hostname, key):
-        if self.expected is None:
-            raise UnknownHostKey
-        digest = hashlib.sha256(key.asbytes()).digest()
-        actual = "SHA256:" + base64.b64encode(digest).decode().rstrip("=")
-        if not hmac.compare_digest(actual, self.expected):
-            raise paramiko.SSHException("Host fingerprint mismatch")
-
-
-def connect(host, port, username, fingerprint, password=None):
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(HostPin(fingerprint))
+def save_host_keys(host_keys, path):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as staged:
+        temporary = Path(staged.name)
     try:
-        if fingerprint is None:
-            client.load_system_host_keys()
+        host_keys.save(str(temporary))
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+
+def connect(host, port, username, password=None):
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    path = Path.home() / ".ssh" / "telegram-vps-known-hosts"
+    host_keys = client.get_host_keys()
+    try:
+        client.load_system_host_keys()
+        if path.exists():
+            host_keys.load(str(path))
+        known_count = len(host_keys)
         client.connect(
             host, port=port, username=username, password=password,
             key_filename=os.getenv("SSH_KEY_PATH") if password is None else None,
             look_for_keys=False, allow_agent=False, timeout=15,
             banner_timeout=15, auth_timeout=15,
         )
+        if len(host_keys) != known_count:
+            save_host_keys(host_keys, path)
     except BaseException:
         client.close()
         raise
@@ -315,15 +314,6 @@ async def handle_text(update, context):
         state["username"] = username
         await ask_password(message)
         return
-    if state.get("awaiting_fingerprint"):
-        fingerprint = message.text.strip()
-        if not re.fullmatch(r"SHA256:[A-Za-z0-9+/]{43}", fingerprint):
-            await message.reply_text("اثرانگشت SSH را در قالب SHA256:… بفرست.")
-            return
-        state["fingerprint"] = fingerprint
-        state.pop("awaiting_fingerprint")
-        await ask_password(message)
-        return
     if "client" not in state:
         use_key = message.text == "." and os.getenv("SSH_KEY_PATH")
         password = None if use_key else message.text
@@ -334,17 +324,13 @@ async def handle_text(update, context):
                 await message.reply_text("حذف پیام رمز ناموفق بود. پیام را دستی حذف کن.")
         try:
             client = await asyncio.to_thread(
-                connect, *state["address"], state["username"], state.get("fingerprint"), password,
+                connect, *state["address"], state["username"], password,
             )
-        except UnknownHostKey:
-            state["awaiting_fingerprint"] = True
-            await message.reply_text(
-                "کلید این سرور روی میزبان ربات ثبت نشده است. اثرانگشت SHA256 را "
-                "از کنسول مورد اعتماد VPS بگیر و بفرست. بعد رمز را دوباره می‌پرسم."
-            )
+        except paramiko.BadHostKeyException:
+            await message.reply_text("کلید SSH این سرور تغییر کرده است. کلید جدید را روی میزبان ربات بررسی کن.")
             return
         except (OSError, paramiko.SSHException, ValueError):
-            await message.reply_text("اتصال برقرار نشد. اثرانگشت، دسترسی و اطلاعات ورود را بررسی کن. برای تغییر سرور /cancel را بزن.")
+            await message.reply_text("اتصال برقرار نشد. دسترسی و اطلاعات ورود را بررسی کن. برای تغییر سرور /cancel را بزن.")
             return
         if state["action"] == "ssh":
             state["client"] = client
