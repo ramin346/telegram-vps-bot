@@ -1,0 +1,19 @@
+[Unit]
+Description=Telegram VPS administration bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=telegram-vps
+WorkingDirectory=/opt/telegram-vps-bot
+EnvironmentFile=/etc/telegram-vps-bot.env
+ExecStartPre=/opt/telegram-vps-bot/.venv/bin/python -m pip install --disable-pip-version-check -r requirements.txt
+ExecStart=/opt/telegram-vps-bot/.venv/bin/python bot.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
