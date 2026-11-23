@@ -5,13 +5,18 @@ import logging
 import os
 from pathlib import Path
 import re
+import secrets
 import shlex
+import sqlite3
 import subprocess
 import tempfile
 import time
 
 import paramiko
-from telegram import CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
+    KeyboardButtonRequestUsers, ReplyKeyboardMarkup, ReplyKeyboardRemove,
+)
 from telegram.error import TelegramError
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters,
@@ -152,10 +157,26 @@ def update_checkout():
     return old != git("rev-parse", "HEAD")
 
 
+def load_admins():
+    path = Path.home() / ".local" / "share" / "telegram-vps-bot"
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    db = sqlite3.connect(path / "admins.sqlite3")
+    with db:
+        db.execute("CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY)")
+    return db, {row[0] for row in db.execute("SELECT user_id FROM admins")}
+
+
+def private_owner(update):
+    return (
+        update.effective_chat.type == "private"
+        and update.effective_user.id in OWNER_IDS
+    )
+
+
 def private_admin(update):
     return (
         update.effective_chat.type == "private"
-        and update.effective_user.id in ADMIN_IDS
+        and (update.effective_user.id in OWNER_IDS or update.effective_user.id in ADDED_ADMINS)
     )
 
 
@@ -169,17 +190,21 @@ def clear(context):
     context.user_data.clear()
 
 
-def menu():
+def menu(owner):
     rows = [[InlineKeyboardButton(LABELS[name], callback_data=name)] for name in ("ssh", "node")]
     rows.append([InlineKeyboardButton(LABELS[name], callback_data=name) for name in ("on", "off")])
-    rows.append([InlineKeyboardButton(LABELS["update"], callback_data="update")])
+    if owner:
+        rows.append([
+            InlineKeyboardButton("➕ افزودن ادمین", callback_data="add_admin"),
+            InlineKeyboardButton(LABELS["update"], callback_data="update"),
+        ])
     return InlineKeyboardMarkup(rows)
 
 
 async def start(update, context):
     if private_admin(update):
         clear(context)
-        await update.message.reply_text("عملیات سرور را انتخاب کن.", reply_markup=menu())
+        await update.message.reply_text("عملیات سرور را انتخاب کن.", reply_markup=menu(private_owner(update)))
 
 
 async def update_bot(message, context):
@@ -202,7 +227,7 @@ async def update_bot(message, context):
 
 
 async def update_command(update, context):
-    if private_admin(update):
+    if private_owner(update):
         await update_bot(update.message, context)
 
 
@@ -212,7 +237,8 @@ async def select(update, context):
     if not private_admin(update) or query.data not in LABELS:
         return
     if query.data == "update":
-        await update_bot(query.message, context)
+        if private_owner(update):
+            await update_bot(query.message, context)
         return
     clear(context)
     context.user_data["action"] = query.data
@@ -223,13 +249,65 @@ async def select(update, context):
     )
 
 
+async def add_admin(update, context):
+    query = update.callback_query
+    await query.answer()
+    if not private_owner(update):
+        return
+    clear(context)
+    request_id = secrets.randbelow(2**31)
+    context.user_data["admin_request"] = request_id
+    chooser = KeyboardButton(
+        "انتخاب کاربر در تلگرام",
+        request_users=KeyboardButtonRequestUsers(request_id, user_is_bot=False, request_username=True),
+    )
+    await query.message.reply_text(
+        "آیدی عددی کاربر را بفرست یا با دکمهٔ پایین، کاربر را با نام کاربری پیدا و انتخاب کن. "
+        "برای برگشت /cancel را بزن.",
+        reply_markup=ReplyKeyboardMarkup([[chooser]], resize_keyboard=True, one_time_keyboard=True),
+    )
+
+
+async def grant_admin(update, context, user_id):
+    try:
+        with ADMIN_DB:
+            if user_id not in OWNER_IDS:
+                ADMIN_DB.execute("INSERT OR IGNORE INTO admins VALUES (?)", (user_id,))
+    except sqlite3.Error:
+        await update.message.reply_text("ذخیرهٔ ادمین ناموفق بود. دوباره تلاش کن.")
+        return
+    ADDED_ADMINS.add(user_id)
+    clear(context)
+    await update.message.reply_text(
+        f"دسترسی آیدی {user_id} فعال است. کاربر می‌تواند /start را در چت خصوصی ربات بزند.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await update.message.reply_text("عملیات بعدی را انتخاب کن.", reply_markup=menu(True))
+
+
+async def shared_admin(update, context):
+    if not private_owner(update):
+        return
+    shared = update.message.users_shared
+    state = context.user_data
+    if shared.request_id != state.get("admin_request") or len(shared.users) != 1:
+        return
+    user = shared.users[0]
+    if "admin_username" in state and (user.username or "").lower() != state["admin_username"]:
+        await update.message.reply_text("نام کاربری انتخاب‌شده مطابقت ندارد. کاربر درست را انتخاب کن.")
+        return
+    await grant_admin(update, context, user.user_id)
+
+
 async def cancel(update, context):
     if not private_admin(update):
         return
     if update.callback_query:
         await update.callback_query.answer()
+    if "admin_request" in context.user_data:
+        await update.effective_message.reply_text("افزودن ادمین لغو شد.", reply_markup=ReplyKeyboardRemove())
     clear(context)
-    await update.effective_message.reply_text("اتصال بسته شد. عملیات بعدی را انتخاب کن.", reply_markup=menu())
+    await update.effective_message.reply_text("اتصال بسته شد. عملیات بعدی را انتخاب کن.", reply_markup=menu(private_owner(update)))
 
 
 def parse_address(value):
@@ -245,9 +323,9 @@ def parse_address(value):
     return str(IPv6Address(match[1])) if match[1] else match[2], port
 
 
-async def ask_password(message):
+async def ask_password(message, owner):
     prompt = "رمز SSH را بفرست. ربات تلاش می‌کند پیام رمز را پس از دریافت حذف کند."
-    if os.getenv("SSH_KEY_PATH"):
+    if owner and os.getenv("SSH_KEY_PATH"):
         prompt += " برای ورود با کلید تنظیم‌شده، یک نقطه (.) بفرست."
     await message.reply_text(prompt + " گفت‌وگو با ربات تلگرام رمزنگاری سرتاسری ندارد.")
 
@@ -292,11 +370,21 @@ async def handle_text(update, context):
         return
     state = context.user_data
     message = update.message
+    if private_owner(update) and "admin_request" in state:
+        value = message.text.strip()
+        if re.fullmatch(r"[0-9]{1,16}", value) and 0 < int(value) < 2**52:
+            await grant_admin(update, context, int(value))
+        elif re.fullmatch(r"@?[A-Za-z0-9_]{1,32}", value):
+            state["admin_username"] = value.lstrip("@").lower()
+            await message.reply_text("همین نام کاربری را با دکمهٔ «انتخاب کاربر در تلگرام» پیدا و تأیید کن.")
+        else:
+            await message.reply_text("آیدی عددی یا نام کاربری معتبر بفرست.")
+        return
     if "action" not in state:
         return
     if "client" in state and time.monotonic() >= state["expires"]:
         clear(context)
-        await message.reply_text("مهلت اتصال تمام شد.", reply_markup=menu())
+        await message.reply_text("مهلت اتصال تمام شد.", reply_markup=menu(private_owner(update)))
         return
     if "address" not in state:
         try:
@@ -312,10 +400,10 @@ async def handle_text(update, context):
             await message.reply_text("نام کاربری معتبر نیست. دوباره بفرست.")
             return
         state["username"] = username
-        await ask_password(message)
+        await ask_password(message, private_owner(update))
         return
     if "client" not in state:
-        use_key = message.text == "." and os.getenv("SSH_KEY_PATH")
+        use_key = private_owner(update) and message.text == "." and os.getenv("SSH_KEY_PATH")
         password = None if use_key else message.text
         if password is not None:
             try:
@@ -347,7 +435,7 @@ async def handle_text(update, context):
         finally:
             client.close()
             clear(context)
-        await message.reply_text("عملیات بعدی را انتخاب کن.", reply_markup=menu())
+        await message.reply_text("عملیات بعدی را انتخاب کن.", reply_markup=menu(private_owner(update)))
         return
     try:
         await operate(message, state, state["client"], message.text)
@@ -369,13 +457,16 @@ async def report_error(update, context):
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.WARNING)
-    ADMIN_IDS = {int(value) for value in os.environ["TELEGRAM_ADMIN_IDS"].split(",")}
+    OWNER_IDS = {int(value) for value in os.environ["TELEGRAM_ADMIN_IDS"].split(",")}
+    ADMIN_DB, ADDED_ADMINS = load_admins()
     application = Application.builder().token(os.environ["TELEGRAM_BOT_TOKEN"]).build()
     application.add_handler(CommandHandler(["start", "menu"], start))
     application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(CommandHandler("update", update_command))
     application.add_handler(CallbackQueryHandler(cancel, pattern=r"^cancel$"))
     application.add_handler(CallbackQueryHandler(select, pattern=r"^(ssh|node|on|off|update)$"))
+    application.add_handler(CallbackQueryHandler(add_admin, pattern=r"^add_admin$"))
+    application.add_handler(MessageHandler(filters.StatusUpdate.USERS_SHARED, shared_admin))
     application.add_handler(MessageHandler(filters.TEXT, handle_text))
     application.add_error_handler(report_error)
     application.run_polling(drop_pending_updates=True, allowed_updates=["message", "callback_query"])
