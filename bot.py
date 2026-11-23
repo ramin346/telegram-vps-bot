@@ -13,6 +13,7 @@ import tempfile
 import time
 
 import paramiko
+from cryptography.fernet import Fernet, InvalidToken
 from telegram import (
     CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
     KeyboardButtonRequestUsers, ReplyKeyboardMarkup, ReplyKeyboardRemove,
@@ -166,6 +167,47 @@ def load_admins():
     return db, {row[0] for row in db.execute("SELECT user_id FROM admins")}
 
 
+def init_servers(db):
+    key_path = Path.home() / ".local" / "share" / "telegram-vps-bot" / "servers.key"
+    with db:
+        db.execute("PRAGMA secure_delete = ON")
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS servers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                host TEXT NOT NULL,
+                port INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                secret BLOB,
+                UNIQUE (user_id, host, port, username)
+            )
+        """)
+    if not key_path.exists() and not db.execute("SELECT 1 FROM servers WHERE secret IS NOT NULL LIMIT 1").fetchone():
+        try:
+            def private_file(name, flags):
+                return os.open(name, flags, 0o600)
+
+            with open(key_path, "xb", opener=private_file) as key_file:
+                key_file.write(Fernet.generate_key())
+        except FileExistsError:
+            pass
+    return Fernet(key_path.read_bytes())
+
+
+def save_server(user_id, address, username, password):
+    secret = SERVER_CIPHER.encrypt(password.encode()) if password is not None else None
+    with ADMIN_DB:
+        ADMIN_DB.execute("""
+            INSERT INTO servers (user_id, host, port, username, secret) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (user_id, host, port, username) DO UPDATE SET secret = excluded.secret
+        """, (user_id, *address, username, secret))
+
+
+def server_label(host, port, username):
+    address = f"[{host}]" if ":" in host else host
+    return f"{username}@{address}:{port}"
+
+
 def private_owner(update):
     return (
         update.effective_chat.type == "private"
@@ -193,6 +235,7 @@ def clear(context):
 def menu(owner):
     rows = [[InlineKeyboardButton(LABELS[name], callback_data=name)] for name in ("ssh", "node")]
     rows.append([InlineKeyboardButton(LABELS[name], callback_data=name) for name in ("on", "off")])
+    rows.append([InlineKeyboardButton("🖥 سرورهای من", callback_data="my_servers")])
     if owner:
         rows.append([
             InlineKeyboardButton("➕ افزودن ادمین", callback_data="add_admin"),
@@ -242,11 +285,116 @@ async def select(update, context):
         return
     clear(context)
     context.user_data["action"] = query.data
-    await query.message.reply_text(
+    await show_servers(update, context)
+
+
+async def ask_address(message):
+    await message.reply_text(
         "آی‌پی یا آدرس سرور را بفرست. "
         "برای پورت سفارشی از host:port یا [IPv6]:port استفاده کن.",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بازگشت", callback_data="cancel")]]),
     )
+
+
+async def show_servers(update, context, page=0):
+    message = update.effective_message
+    user_id = update.effective_user.id
+    state = context.user_data
+    rows = ADMIN_DB.execute(
+        "SELECT id, host, port, username FROM servers WHERE user_id = ? ORDER BY id DESC LIMIT 9 OFFSET ?",
+        (user_id, page * 8),
+    ).fetchall()
+    if not rows and page:
+        return await show_servers(update, context, page - 1)
+    if not rows and state.get("action"):
+        await ask_address(message)
+        return
+    token = secrets.token_hex(6)
+    state["servers_token"] = token
+    keyboard = [
+        [InlineKeyboardButton(server_label(host, port, username)[:64], callback_data=f"s:{token}:pick:{row_id}")]
+        for row_id, host, port, username in rows[:8]
+    ]
+    navigation = []
+    if page:
+        navigation.append(InlineKeyboardButton("قبلی", callback_data=f"s:{token}:page:{page - 1}"))
+    if len(rows) > 8:
+        navigation.append(InlineKeyboardButton("بعدی", callback_data=f"s:{token}:page:{page + 1}"))
+    if navigation:
+        keyboard.append(navigation)
+    if state.get("action"):
+        keyboard.append([InlineKeyboardButton("➕ سرور جدید", callback_data=f"s:{token}:new:0")])
+    keyboard.append([InlineKeyboardButton("بازگشت", callback_data="cancel")])
+    await message.reply_text(
+        "یک سرور انتخاب کن." if rows else "هنوز سروری ذخیره نشده است. با اولین ورود موفق، سرور به این فهرست اضافه می‌شود.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def my_servers(update, context):
+    await update.callback_query.answer()
+    if private_admin(update):
+        clear(context)
+        await show_servers(update, context)
+
+
+async def server_button(update, context):
+    query = update.callback_query
+    state = context.user_data
+    _, token, verb, value = query.data.split(":")
+    if not private_admin(update) or token != state.get("servers_token"):
+        await query.answer("این منو بسته شده است.")
+        return
+    await query.answer()
+    if verb == "page":
+        await show_servers(update, context, int(value))
+        return
+    if verb == "new":
+        state.pop("servers_token")
+        await ask_address(query.message)
+        return
+    user_id = update.effective_user.id
+    server_id = int(value)
+    row = ADMIN_DB.execute(
+        "SELECT host, port, username, secret FROM servers WHERE user_id = ? AND id = ?", (user_id, server_id),
+    ).fetchone()
+    if row is None:
+        await show_servers(update, context)
+        return
+    host, port, username, secret = row
+    action = state.get("action")
+    if verb == "delete" and not action:
+        with ADMIN_DB:
+            ADMIN_DB.execute("DELETE FROM servers WHERE user_id = ? AND id = ?", (user_id, server_id))
+        await query.message.reply_text("سرور از فهرست ذخیره‌شده حذف شد.")
+        await show_servers(update, context)
+        return
+    if verb == "pick" and not action:
+        state["servers_token"] = secrets.token_hex(6)
+        token = state["servers_token"]
+        await query.message.reply_text(
+            server_label(host, port, username),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("اتصال SSH", callback_data=f"s:{token}:connect:{server_id}")],
+                [InlineKeyboardButton("حذف سرور", callback_data=f"s:{token}:delete:{server_id}")],
+                [InlineKeyboardButton("بازگشت به فهرست", callback_data=f"s:{token}:page:0")],
+            ]),
+        )
+        return
+    if verb == "connect" or (verb == "pick" and action):
+        state.pop("servers_token")
+        state.update(action=action or "ssh", address=(host, port), username=username)
+        if secret is None and not (private_owner(update) and os.getenv("SSH_KEY_PATH")):
+            await ask_password(query.message, private_owner(update))
+            return
+        try:
+            password = SERVER_CIPHER.decrypt(secret).decode() if secret is not None else None
+        except InvalidToken:
+            await query.message.reply_text("رمز ذخیره‌شده خوانده نشد. رمز SSH را دوباره بفرست.")
+            await ask_password(query.message, private_owner(update))
+            return
+        if not await login_server(update, context, password, remember=False):
+            await ask_password(query.message, private_owner(update))
 
 
 async def add_admin(update, context):
@@ -324,7 +472,7 @@ def parse_address(value):
 
 
 async def ask_password(message, owner):
-    prompt = "رمز SSH را بفرست. ربات تلاش می‌کند پیام رمز را پس از دریافت حذف کند."
+    prompt = "رمز SSH را بفرست. بعد از ورود موفق، اطلاعات برای حساب تلگرام تو ذخیره می‌شود. ربات تلاش می‌کند پیام رمز را حذف کند."
     if owner and os.getenv("SSH_KEY_PATH"):
         prompt += " برای ورود با کلید تنظیم‌شده، یک نقطه (.) بفرست."
     await message.reply_text(prompt + " گفت‌وگو با ربات تلگرام رمزنگاری سرتاسری ندارد.")
@@ -380,7 +528,7 @@ async def handle_text(update, context):
         else:
             await message.reply_text("آیدی عددی یا نام کاربری معتبر بفرست.")
         return
-    if "action" not in state:
+    if "action" not in state or "servers_token" in state:
         return
     if "client" in state and time.monotonic() >= state["expires"]:
         clear(context)
@@ -410,37 +558,50 @@ async def handle_text(update, context):
                 await message.delete()
             except TelegramError:
                 await message.reply_text("حذف پیام رمز ناموفق بود. پیام را دستی حذف کن.")
-        try:
-            client = await asyncio.to_thread(
-                connect, *state["address"], state["username"], password,
-            )
-        except paramiko.BadHostKeyException:
-            await message.reply_text("کلید SSH این سرور تغییر کرده است. کلید جدید را روی میزبان ربات بررسی کن.")
-            return
-        except (OSError, paramiko.SSHException, ValueError):
-            await message.reply_text("اتصال برقرار نشد. دسترسی و اطلاعات ورود را بررسی کن. برای تغییر سرور /cancel را بزن.")
-            return
-        if state["action"] == "ssh":
-            state["client"] = client
-            state["expires"] = time.monotonic() + 600
-            state["expiry_job"] = context.application.job_queue.run_once(
-                expire, 600, data=client, user_id=update.effective_user.id,
-            )
-            await message.reply_text("متصل شدی. هر پیام یک دستور جداگانه است. برای بستن اتصال /cancel را بزن.")
-            return
-        try:
-            await operate(message, state, client)
-        except (OSError, paramiko.SSHException):
-            await message.reply_text("ارتباط قطع شد یا مهلت عملیات تمام شد.")
-        finally:
-            client.close()
-            clear(context)
-        await message.reply_text("عملیات بعدی را انتخاب کن.", reply_markup=menu(private_owner(update)))
+        state.pop("servers_token", None)
+        await login_server(update, context, password)
         return
     try:
         await operate(message, state, state["client"], message.text)
     except (OSError, paramiko.SSHException):
         await cancel(update, context)
+
+
+async def login_server(update, context, password, remember=True):
+    state = context.user_data
+    message = update.effective_message
+    try:
+        client = await asyncio.to_thread(
+            connect, *state["address"], state["username"], password,
+        )
+    except paramiko.BadHostKeyException:
+        await message.reply_text("کلید SSH این سرور تغییر کرده است. کلید جدید را روی میزبان ربات بررسی کن.")
+        return False
+    except (OSError, paramiko.SSHException, ValueError):
+        await message.reply_text("اتصال برقرار نشد. دسترسی و اطلاعات ورود را بررسی کن. برای تغییر سرور /cancel را بزن.")
+        return False
+    if remember:
+        try:
+            save_server(update.effective_user.id, state["address"], state["username"], password)
+        except sqlite3.Error:
+            await message.reply_text("اتصال برقرار شد، اما ذخیرهٔ سرور ناموفق بود.")
+    if state["action"] == "ssh":
+        state["client"] = client
+        state["expires"] = time.monotonic() + 600
+        state["expiry_job"] = context.application.job_queue.run_once(
+            expire, 600, data=client, user_id=update.effective_user.id,
+        )
+        await message.reply_text("متصل شدی. هر پیام یک دستور جداگانه است. برای بستن اتصال /cancel را بزن.")
+        return True
+    try:
+        await operate(message, state, client)
+    except (OSError, paramiko.SSHException):
+        await message.reply_text("ارتباط قطع شد یا مهلت عملیات تمام شد.")
+    finally:
+        client.close()
+        clear(context)
+    await message.reply_text("عملیات بعدی را انتخاب کن.", reply_markup=menu(private_owner(update)))
+    return True
 
 
 async def expire(context):
@@ -459,12 +620,15 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.WARNING)
     OWNER_IDS = {int(value) for value in os.environ["TELEGRAM_ADMIN_IDS"].split(",")}
     ADMIN_DB, ADDED_ADMINS = load_admins()
+    SERVER_CIPHER = init_servers(ADMIN_DB)
     application = Application.builder().token(os.environ["TELEGRAM_BOT_TOKEN"]).build()
     application.add_handler(CommandHandler(["start", "menu"], start))
     application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(CommandHandler("update", update_command))
     application.add_handler(CallbackQueryHandler(cancel, pattern=r"^cancel$"))
     application.add_handler(CallbackQueryHandler(select, pattern=r"^(ssh|node|on|off|update)$"))
+    application.add_handler(CallbackQueryHandler(my_servers, pattern=r"^my_servers$"))
+    application.add_handler(CallbackQueryHandler(server_button, pattern=r"^s:[0-9a-f]{12}:(pick|page|new|connect|delete):[0-9]+$"))
     application.add_handler(CallbackQueryHandler(add_admin, pattern=r"^add_admin$"))
     application.add_handler(MessageHandler(filters.StatusUpdate.USERS_SHARED, shared_admin))
     application.add_handler(MessageHandler(filters.TEXT, handle_text))
