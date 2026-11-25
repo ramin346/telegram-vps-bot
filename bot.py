@@ -595,7 +595,7 @@ async def kamatera_button(update, context):
     if action == "km:key":
         state["kamatera"] = {"step": "key"}
         await message.reply_text(
-            "Client ID و API Secret را در دو خطِ یک پیام بفرست. ربات تلاش می‌کند پیام را حذف کند. "
+            "Access Key مربوط به API سرور کاماترا را بفرست. بعد Secret Key را می‌پرسم. ربات تلاش می‌کند پیام‌ها را حذف کند. "
             "چت ربات رمزنگاری سرتاسری ندارد."
         )
         return
@@ -647,22 +647,33 @@ async def kamatera_text(update, context):
     step = draft["step"]
     value = message.text.strip()
     user_id = update.effective_user.id
-    if step == "key":
+    if step in {"key", "key_secret"}:
         await delete_secret_message(message)
-        fields = value.splitlines()
-        if len(fields) != 2 or not all(field.strip() for field in fields):
-            await message.reply_text("Client ID و API Secret را هرکدام در یک خط بفرست.")
+        fields = [field.strip() for field in value.splitlines()]
+        if step == "key" and len(fields) == 1 and fields[0]:
+            draft.update(step="key_secret", client_id=fields[0])
+            await message.reply_text("حالا Secret Key کاماترا را بفرست.")
+            return
+        if step == "key_secret":
+            if len(fields) != 1 or not fields[0]:
+                await message.reply_text("فقط مقدار Secret Key را در یک خط بفرست.")
+                return
+            fields.insert(0, draft["client_id"])
+        if len(fields) != 2 or not all(fields):
+            await message.reply_text("اول Access Key را بفرست. همچنین می‌توانی Access Key و Secret Key را در دو خطِ یک پیام بفرستی.")
             return
         try:
-            await kamatera.authenticate(*(field.strip() for field in fields))
+            await kamatera.authenticate(*fields)
         except kamatera.APIError:
-            await message.reply_text("احراز هویت کاماترا ناموفق بود. کلید را بررسی کن و دوباره بفرست.")
+            draft.pop("client_id", None)
+            draft["step"] = "key"
+            await message.reply_text("احراز هویت ناموفق بود. Access Key مربوط به API سرور را دوباره بفرست. کلیدهای Object Storage برای این بخش نیستند.")
             return
         with ADMIN_DB:
             ADMIN_DB.execute(
                 """INSERT INTO kamatera_accounts VALUES (?, ?, NULL)
                    ON CONFLICT(user_id) DO UPDATE SET credentials=excluded.credentials, command_id=NULL""",
-                (user_id, SERVER_CIPHER.encrypt("\n".join(field.strip() for field in fields).encode())),
+                (user_id, SERVER_CIPHER.encrypt("\n".join(fields).encode())),
             )
         clear(context)
         await message.reply_text("کلید API کاماترا تأیید و رمزگذاری شد.")
