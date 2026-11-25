@@ -1866,6 +1866,7 @@ async def cf_rotation_details(message, state, user_id, rotation_id):
         date = datetime.fromtimestamp(row.due_at, ZoneInfo("Asia/Tehran")).strftime("%Y-%m-%d %H:%M:%S")
         text += f"\nIP مرحلهٔ بعد: {steps[0][1]}\nزمان اجرای بعدی: {date} به وقت تهران"
         rows.insert(0, [("⚡ الان عوض کن", "rot_now"), ("🛑 لغو برنامه", "rot_cancel")])
+    rows.append([("🗑 حذف برنامه", "rot_delete")])
     if row.note:
         text += "\n" + row.note
     await message.reply_text(text, reply_markup=cf_keyboard(state, rows))
@@ -1960,6 +1961,24 @@ async def cf_rotation_button(message, state, token, user_id, action):
         elif updated.status == "active":
             await message.reply_text("تغییر فوری تأیید نشد. ربات در زمان نمایش‌داده‌شده دوباره تلاش می‌کند.")
         await cf_rotation_details(message, state, user_id, rotation_id)
+    elif action == "rot_delete":
+        row = dns_rotation.get(ADMIN_DB, user_id, state["rotation_id"])
+        if not row or row.zone_id != state["zone"]["id"]:
+            await cf_rotation_list(message, state, user_id)
+            return
+        await message.reply_text(
+            f"برنامهٔ تعویض IP «{row.name}» حذف شود؟ مرحله‌های باقی‌مانده اجرا نخواهند شد.",
+            reply_markup=cf_keyboard(state, [
+                [("🗑 تأیید حذف برنامه", "rot_remove"), ("انصراف", "rot_refresh")],
+            ]),
+        )
+    elif action == "rot_remove":
+        state.pop("nonce", None)
+        async with ROTATION_LOCK:
+            removed = dns_rotation.delete(ADMIN_DB, user_id, state["zone"]["id"], state["rotation_id"])
+        if removed:
+            await message.reply_text("برنامهٔ تعویض IP حذف شد.")
+        await cf_rotation_list(message, state, user_id)
     elif action == "rot_cancel":
         async with ROTATION_LOCK:
             row = dns_rotation.get(ADMIN_DB, user_id, state["rotation_id"])
@@ -2835,7 +2854,7 @@ if __name__ == "__main__":
     ))
     application.add_handler(CallbackQueryHandler(
         cloudflare_button,
-        pattern=r"^(?:cloudflare|cf:(?:key|zones)|cp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|zones|list|edit_list|search|dns|add|type:(?:A|AAAA|CNAME)|field:(?:name|content|proxied|ttl)|proxy:(?:on|off)|ttl:(?:1|60|300|600|1800|3600)|delete|confirm|rotate|rot_(?:next|review|confirm|list|refresh|now|cancel|page:[0-9]{1,8})))$",
+        pattern=r"^(?:cloudflare|cf:(?:key|zones)|cp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|zones|list|edit_list|search|dns|add|type:(?:A|AAAA|CNAME)|field:(?:name|content|proxied|ttl)|proxy:(?:on|off)|ttl:(?:1|60|300|600|1800|3600)|delete|confirm|rotate|rot_(?:next|review|confirm|list|refresh|now|cancel|delete|remove|page:[0-9]{1,8})))$",
     ))
     application.add_handler(CallbackQueryHandler(
         hetzner_button,

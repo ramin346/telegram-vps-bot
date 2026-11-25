@@ -80,6 +80,15 @@ def stop(db, rotation, status, note=""):
         )
 
 
+def delete(db, user_id, zone_id, rotation_id):
+    with db:
+        result = db.execute(
+            "DELETE FROM dns_rotations WHERE user_id = ? AND zone_id = ? AND id = ?",
+            (user_id, zone_id, rotation_id),
+        )
+    return result.rowcount == 1
+
+
 def retry(db, rotation):
     attempts = rotation.attempts + 1
     if attempts >= MAX_RETRIES:
