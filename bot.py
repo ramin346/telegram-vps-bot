@@ -24,6 +24,7 @@ from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters,
 )
 
+import hetzner
 import kamatera
 import linode
 
@@ -194,8 +195,10 @@ def init_servers(db):
         """)
     with db:
         db.execute("CREATE TABLE IF NOT EXISTS linode_accounts (user_id INTEGER PRIMARY KEY, token BLOB NOT NULL)")
+    with db:
+        db.execute("CREATE TABLE IF NOT EXISTS hetzner_accounts (user_id INTEGER PRIMARY KEY, token BLOB NOT NULL)")
     has_saved_secrets = db.execute(
-        "SELECT 1 FROM servers WHERE secret IS NOT NULL UNION ALL SELECT 1 FROM kamatera_accounts UNION ALL SELECT 1 FROM linode_accounts LIMIT 1"
+        "SELECT 1 FROM servers WHERE secret IS NOT NULL UNION ALL SELECT 1 FROM kamatera_accounts UNION ALL SELECT 1 FROM linode_accounts UNION ALL SELECT 1 FROM hetzner_accounts LIMIT 1"
     ).fetchone()
     if not key_path.exists() and not has_saved_secrets:
         try:
@@ -256,6 +259,7 @@ def menu(owner):
             InlineKeyboardButton("☁️ سرور کاماترا", callback_data="kamatera"),
             InlineKeyboardButton("☁️ سرور Linode", callback_data="linode"),
         ])
+        rows.append([InlineKeyboardButton("☁️ سرور هتزنر", callback_data="hetzner")])
         rows.append([
             InlineKeyboardButton("➕ افزودن ادمین", callback_data="add_admin"),
             InlineKeyboardButton(LABELS["update"], callback_data="update"),
@@ -1001,15 +1005,23 @@ def linode_token(user_id):
     return SERVER_CIPHER.decrypt(row[0]).decode() if row else None
 
 
-def linode_keyboard(state, rows):
+def nonce_keyboard(state, rows, prefix):
     nonce = state["nonce"] = secrets.token_hex(8)
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(label, callback_data=f"lp:{nonce}:{action}") for label, action in row]
+        [InlineKeyboardButton(label, callback_data=f"{prefix}:{nonce}:{action}") for label, action in row]
         for row in rows
     ])
 
 
+def linode_keyboard(state, rows):
+    return nonce_keyboard(state, rows, "lp")
+
+
 async def show_linode_picker(message, state, page=0):
+    await show_cloud_picker(message, state, page, LINODE_PICKERS[state["step"]], "lp", "منوی Linode", "linode")
+
+
+async def show_cloud_picker(message, state, page, prompt, prefix, menu_label, menu_action):
     choices = state["choices"]
     offset = page * 8
     rows = [
@@ -1023,10 +1035,10 @@ async def show_linode_picker(message, state, page=0):
         navigation.append(("بعدی", f"page:{page + 1}"))
     if navigation:
         rows.append(navigation)
-    markup = linode_keyboard(state, rows)
-    keyboard = [*markup.inline_keyboard, [InlineKeyboardButton("منوی Linode", callback_data="linode")]]
+    markup = nonce_keyboard(state, rows, prefix)
+    keyboard = [*markup.inline_keyboard, [InlineKeyboardButton(menu_label, callback_data=menu_action)]]
     await message.reply_text(
-        LINODE_PICKERS[state["step"]] if choices else "گزینه‌ای برای نمایش پیدا نشد.",
+        prompt if choices else "گزینه‌ای برای نمایش پیدا نشد.",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -1260,11 +1272,268 @@ async def linode_text(update, context):
         await message.reply_text("از دکمه‌های همین مرحله استفاده کن یا /cancel را بزن.")
 
 
+HETZNER_PROMPTS = {
+    "location": "لوکیشن را انتخاب کن.",
+    "type": "پلن را انتخاب کن.",
+    "image": "سیستم‌عامل را انتخاب کن.",
+    "ssh": "کلید SSH پروژه را انتخاب کن. برای دریافت رمز اولیهٔ root، گزینهٔ بدون کلید را بزن.",
+    "servers": "یک VPS هتزنر را انتخاب کن.",
+}
+HETZNER_OPERATIONS = {**hetzner.POWER, "delete": "حذف دائمی"}
+
+
+def hetzner_token(user_id):
+    row = ADMIN_DB.execute("SELECT token FROM hetzner_accounts WHERE user_id = ?", (user_id,)).fetchone()
+    return SERVER_CIPHER.decrypt(row[0]).decode() if row else None
+
+
+def hetzner_keyboard(state, rows):
+    return nonce_keyboard(state, rows, "hp")
+
+
+async def show_hetzner_picker(message, state, page=0):
+    await show_cloud_picker(
+        message, state, page, HETZNER_PROMPTS[state["step"]], "hp", "منوی هتزنر", "hetzner",
+    )
+
+
+async def show_hetzner_server(message, state, token):
+    server = await hetzner.server_details(token, state["instance"])
+    state.update(step="instance", name=str(server.get("name") or state["instance"])[:120])
+    net = server.get("public_net") or {}
+    addresses = [(net.get(key) or {}).get("ip") for key in ("ipv4", "ipv6")]
+    location = (server.get("location") or (server.get("datacenter") or {}).get("location") or {}).get("name")
+    plan = (server.get("server_type") or {}).get("name")
+    rows = [[(label, operation) for operation, label in hetzner.POWER.items()]]
+    if not (server.get("protection") or {}).get("delete"):
+        rows.append([("🗑 حذف سرور", "delete")])
+    rows.append([("تازه‌سازی", "refresh"), ("بازگشت به فهرست", "list")])
+    await message.reply_text(
+        f"سرور: {state['name']}\nوضعیت: {server.get('status') or '—'}\n"
+        f"لوکیشن: {location or '—'}\nپلن: {plan or '—'}\nIP: {', '.join(ip for ip in addresses if ip) or '—'}"
+        + ("\nمحافظت در برابر حذف فعال است." if (server.get("protection") or {}).get("delete") else ""),
+        reply_markup=hetzner_keyboard(state, rows),
+    )
+
+
+async def hetzner_button(update, context):
+    query = update.callback_query
+    if not private_owner(update):
+        await query.answer()
+        return
+    state = context.user_data.get("hetzner", {})
+    action = query.data
+    if action.startswith("hp:"):
+        _, nonce, action = action.split(":", 2)
+        if nonce != state.get("nonce"):
+            await query.answer("این منو بسته شده است.")
+            return
+    else:
+        clear(context)
+        state = {}
+    await query.answer()
+    message = query.message
+    user_id = update.effective_user.id
+    if action == "hetzner":
+        await message.reply_text("مدیریت Hetzner Cloud", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("ثبت یا تعویض توکن", callback_data="he:key")],
+            [InlineKeyboardButton("ساخت VPS", callback_data="he:new"),
+             InlineKeyboardButton("سرورهای موجود", callback_data="he:servers")],
+            [InlineKeyboardButton("بازگشت", callback_data="cancel")],
+        ]))
+        return
+    if action == "he:key":
+        context.user_data["hetzner"] = {"step": "key"}
+        await message.reply_text(
+            "توکن API پروژهٔ هتزنر با دسترسی Read & Write را بفرست. ربات تلاش می‌کند پیام را حذف کند. "
+            "چت ربات رمزنگاری سرتاسری ندارد."
+        )
+        return
+    try:
+        token = hetzner_token(user_id)
+    except InvalidToken:
+        token = None
+    if not token:
+        await message.reply_text("اول توکن هتزنر را ثبت کن.")
+        return
+    try:
+        if action == "he:new":
+            locations, plans = await asyncio.gather(
+                hetzner.catalog(token, "locations"), hetzner.catalog(token, "server_types"),
+            )
+            state.update(step="location", form={}, plans=plans, choices=[
+                (loc["name"], f"{loc.get('city') or loc['name']} · {loc['name']}")
+                for loc in locations if any(hetzner.regional_price(plan, loc["name"]) for plan in plans)
+            ])
+        elif action in {"he:servers", "list"}:
+            servers = await hetzner.catalog(token, "servers")
+            state.update(step="servers", choices=[
+                (row["id"], f"{row.get('name') or row['id']} · {row.get('status', '—')}") for row in servers
+            ])
+        elif action.startswith("page:"):
+            page = int(action.split(":")[1])
+            if page * 8 < len(state["choices"]):
+                await show_hetzner_picker(message, state, page)
+            return
+        elif action.startswith("pick:"):
+            await hetzner_pick(message, state, token, int(action.split(":")[1]))
+            return
+        elif action == "refresh":
+            await show_hetzner_server(message, state, token)
+            return
+        elif action in HETZNER_OPERATIONS and state["step"] == "instance":
+            state.update(step="operation_confirm", operation=action)
+            prompt = f"عملیات «{HETZNER_OPERATIONS[action]}» روی «{state['name']}» با شناسهٔ {state['instance']} انجام شود؟"
+            if action == "delete":
+                prompt += "\nسرور و داده‌های روی دیسک آن برای همیشه حذف می‌شوند."
+            await message.reply_text(prompt, reply_markup=hetzner_keyboard(state, [
+                [("تأیید", "confirm"), ("انصراف", "refresh")],
+            ]))
+            return
+        elif action == "confirm":
+            await hetzner_confirm(message, context, state, token)
+            return
+        else:
+            return
+        context.user_data["hetzner"] = state
+        await show_hetzner_picker(message, state)
+    except hetzner.APIError as exc:
+        if action == "confirm" and (exc.status is None or exc.status >= 500):
+            text = "نتیجهٔ درخواست مشخص نیست. پیش از تکرار، وضعیت را در پنل هتزنر بررسی کن."
+        else:
+            text = "درخواست هتزنر ناموفق بود."
+            if exc.status:
+                text += f" HTTP {exc.status}"
+        await message.reply_text(text)
+
+
+async def hetzner_pick(message, state, token, index):
+    if index >= len(state["choices"]):
+        return
+    value, label = state["choices"][index]
+    step = state["step"]
+    if step == "servers":
+        state["instance"] = value
+        await show_hetzner_server(message, state, token)
+        return
+    form = state["form"]
+    if step == "location":
+        form["location"] = value
+        state.update(step="type", choices=[
+            (plan, f"{plan['name']} · €{price[1]}/mo")
+            for plan in state["plans"] if (price := hetzner.regional_price(plan, value))
+        ])
+    elif step == "type":
+        images = await hetzner.catalog(token, "images", type="system", architecture=value["architecture"], status="available")
+        choices = [
+            (row["id"], str(row.get("description") or row.get("name") or row["id"]))
+            for row in images if not row.get("deprecated") and (row.get("disk_size") or 0) <= value["disk"]
+        ]
+        if not choices:
+            await message.reply_text("ایمیج سازگار پیدا نشد. پلن دیگری انتخاب کن.")
+            return
+        form["server_type"] = value["name"]
+        state.update(step="image", choices=choices, price=hetzner.regional_price(value, form["location"]))
+    elif step == "image":
+        keys = await hetzner.catalog(token, "ssh_keys")
+        form["image"] = value
+        state.update(step="ssh", image=label, choices=[
+            (None, "بدون کلید SSH — دریافت رمز root"),
+            *((row["id"], str(row.get("name") or row["id"])) for row in keys),
+        ])
+    elif step == "ssh":
+        form["ssh_keys"] = [value] if value is not None else []
+        state.update(step="name", ssh_label=label)
+        state.pop("nonce")
+        await message.reply_text("نام VPS را بفرست. برای لغو /cancel را بزن.")
+        return
+    await show_hetzner_picker(message, state)
+
+
+async def hetzner_confirm(message, context, state, token):
+    state.pop("nonce", None)
+    if state["step"] == "create_confirm":
+        form = state["form"]
+        clear(context)
+        result = await hetzner.create(token, form)
+        instance_id = result["server"]["id"]
+        password = result.get("root_password")
+        if password:
+            await message.reply_text(
+                f"درخواست ساخت سرور {instance_id} ثبت شد. رمز اولیهٔ root را ذخیره کن:\n{password}",
+                protect_content=True,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("کپی رمز", copy_text=CopyTextButton(password))]]),
+            )
+        else:
+            await message.reply_text(f"درخواست ساخت سرور {instance_id} ثبت شد. وضعیت را از فهرست سرورها ببین.")
+        return
+    operation = state["operation"]
+    instance = state["instance"]
+    await hetzner.change_server(token, instance, operation)
+    if operation == "delete":
+        clear(context)
+        await message.reply_text(
+            f"درخواست حذف سرور {instance} ثبت شد.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("سرورهای موجود", callback_data="he:servers")]]),
+        )
+    else:
+        await message.reply_text(
+            "درخواست تغییر وضعیت ثبت شد.",
+            reply_markup=hetzner_keyboard(state, [[("تازه‌سازی وضعیت", "refresh")]]),
+        )
+
+
+async def hetzner_text(update, context):
+    message = update.message
+    state = context.user_data["hetzner"]
+    value = message.text.strip()
+    if state["step"] == "key":
+        await delete_secret_message(message)
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,256}", value):
+            await message.reply_text("توکن هتزنر را در یک خط بفرست.")
+            return
+        try:
+            await hetzner.request("GET", "/servers", value, params={"per_page": 1})
+        except hetzner.APIError:
+            await message.reply_text("توکن تأیید نشد. توکن پروژه و دسترسی آن را بررسی کن.")
+            return
+        with ADMIN_DB:
+            ADMIN_DB.execute(
+                "INSERT INTO hetzner_accounts VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET token=excluded.token",
+                (update.effective_user.id, SERVER_CIPHER.encrypt(value.encode())),
+            )
+        clear(context)
+        await message.reply_text(
+            "توکن هتزنر تأیید و رمزگذاری شد.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("منوی هتزنر", callback_data="hetzner")]]),
+        )
+    elif state["step"] == "name":
+        if len(value) > 63 or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?", value):
+            await message.reply_text("نام را با حروف انگلیسی، عدد و خط تیره بفرست. با خط تیره شروع یا تمام نشود.")
+            return
+        state["form"]["name"] = value
+        state["step"] = "create_confirm"
+        form = state["form"]
+        hourly, monthly = state["price"]
+        await message.reply_text(
+            f"سرور: {value}\nلوکیشن: {form['location']}\nپلن: {form['server_type']}\n"
+            f"ایمیج: {state['image']}\nورود: {state['ssh_label']}\n"
+            f"قیمت پلن با مالیات: €{hourly}/ساعت، €{monthly}/ماه\n"
+            "IPv4 عمومی فعال است و جداگانه طبق تعرفهٔ هتزنر حساب می‌شود.",
+            reply_markup=hetzner_keyboard(state, [[("تأیید ساخت و هزینه", "confirm")]]),
+        )
+    else:
+        await message.reply_text("از دکمه‌های همین مرحله استفاده کن یا /cancel را بزن.")
+
+
 async def handle_text(update, context):
     if not private_admin(update):
         return
     state = context.user_data
     message = update.message
+    if private_owner(update) and "hetzner" in state:
+        await hetzner_text(update, context)
+        return
     if private_owner(update) and "linode" in state:
         await linode_text(update, context)
         return
@@ -1380,6 +1649,10 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("update", update_command))
     application.add_handler(CallbackQueryHandler(cancel, pattern=r"^cancel$"))
     application.add_handler(CallbackQueryHandler(select, pattern=r"^(ssh|node|on|off|update)$"))
+    application.add_handler(CallbackQueryHandler(
+        hetzner_button,
+        pattern=r"^(?:hetzner|he:(?:key|new|servers)|hp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|poweron|shutdown|reboot|refresh|list|delete|confirm))$",
+    ))
     application.add_handler(CallbackQueryHandler(
         linode_button, pattern=r"^(?:linode|li:(?:key|new|servers)|lp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|boot|shutdown|reboot|refresh|list|delete|confirm))$",
     ))
