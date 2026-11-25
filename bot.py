@@ -25,6 +25,7 @@ from telegram.ext import (
 )
 
 import cloudflare
+import database_backup
 import hetzner
 import kamatera
 import linode
@@ -264,13 +265,17 @@ def private_admin(update):
 
 
 def clear(context):
-    job = context.user_data.pop("expiry_job", None)
+    clear_user_data(context.user_data)
+
+
+def clear_user_data(state):
+    job = state.pop("expiry_job", None)
     if job:
         job.schedule_removal()
-    client = context.user_data.pop("client", None)
+    client = state.pop("client", None)
     if client:
         client.close()
-    context.user_data.clear()
+    state.clear()
 
 
 def menu(owner):
@@ -290,6 +295,7 @@ def menu(owner):
             InlineKeyboardButton("➕ افزودن ادمین", callback_data="add_admin"),
             InlineKeyboardButton(LABELS["update"], callback_data="update"),
         ])
+        rows.append([InlineKeyboardButton("💾 پشتیبان‌گیری و بازیابی", callback_data="backup")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1960,11 +1966,139 @@ async def cloudflare_text(update, context):
         await cf_input(message, state, "content" if step == "name" else "proxied")
 
 
+async def backup_button(update, context):
+    query = update.callback_query
+    if not private_owner(update):
+        await query.answer()
+        return
+    await query.answer()
+    action = query.data
+    message = query.message
+    if action.startswith("db:apply:"):
+        state = context.user_data.get("backup", {})
+        if state.get("confirmation") != action or time.monotonic() >= state["deadline"]:
+            await message.reply_text("این تأیید منقضی شده است. بازیابی را دوباره شروع کن.")
+            return
+        rows = state["rows"]
+        clear(context)
+        try:
+            database_backup.replace_data(ADMIN_DB, rows)
+        except sqlite3.Error:
+            await message.reply_text("بازیابی ناموفق بود. اطلاعات قبلی در پایگاه داده حفظ شد.")
+            return
+        ADDED_ADMINS.clear()
+        ADDED_ADMINS.update(row[0] for row in rows["admins"])
+        for user_state in context.application.user_data.values():
+            clear_user_data(user_state)
+        await message.reply_text("دیتابیس بازیابی شد.", reply_markup=menu(True))
+        return
+
+    clear(context)
+    if action == "backup":
+        await message.reply_text("پشتیبان‌گیری و بازیابی دیتابیس", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬇️ دریافت فایل پشتیبان", callback_data="db:export")],
+            [InlineKeyboardButton("⬆️ بازیابی از فایل", callback_data="db:import")],
+            [InlineKeyboardButton("بازگشت", callback_data="cancel")],
+        ]))
+    elif action == "db:export":
+        context.user_data["backup"] = {"step": "export", "deadline": time.monotonic() + 600}
+        await message.reply_text(
+            "یک عبارت عبور قوی با حداقل ۱۲ کاراکتر برای رمزگذاری فایل بفرست. "
+            "برای بازیابی به همان عبارت نیاز داری. ربات تلاش می‌کند پیام عبارت عبور را حذف کند."
+        )
+    elif action == "db:import":
+        context.user_data["backup"] = {"step": "document", "deadline": time.monotonic() + 600}
+        await message.reply_text("فایل پشتیبان ربات با پسوند .tvps را به‌صورت فایل بفرست. برای لغو /cancel را بزن.")
+
+
+async def backup_document(update, context):
+    if not private_owner(update):
+        return
+    state = context.user_data.get("backup", {})
+    if state.get("step") != "document":
+        return
+    message = update.message
+    if time.monotonic() >= state["deadline"]:
+        clear(context)
+        await message.reply_text("مهلت بارگذاری تمام شد. بازیابی را دوباره شروع کن.")
+        return
+    doc = message.document
+    if not (doc.file_name or "").lower().endswith(database_backup.SUFFIX) or not (
+        doc.file_size is not None and 0 < doc.file_size <= database_backup.MAX_SIZE
+    ):
+        await message.reply_text("یک فایل پشتیبان .tvps با حجم حداکثر ۸ مگابایت بفرست.")
+        return
+    try:
+        telegram_file = await doc.get_file()
+        data = await telegram_file.download_as_bytearray()
+    except TelegramError:
+        await message.reply_text("دریافت فایل از تلگرام ناموفق بود. دوباره بفرست.")
+        return
+    if len(data) > database_backup.MAX_SIZE or not data.startswith(database_backup.MAGIC):
+        await message.reply_text("فایل معتبر نیست. فایل پشتیبان ربات را بفرست.")
+        return
+    state.update(step="import", document=bytes(data), deadline=time.monotonic() + 600)
+    await message.reply_text("عبارت عبور فایل پشتیبان را بفرست. ربات تلاش می‌کند پیام را حذف کند.")
+
+
+async def backup_text(update, context):
+    state = context.user_data["backup"]
+    message = update.message
+    step = state["step"]
+    if step in {"export", "import"}:
+        await delete_secret_message(message)
+    if time.monotonic() >= state["deadline"]:
+        clear(context)
+        await message.reply_text("مهلت این مرحله تمام شد. از منوی پشتیبان‌گیری دوباره شروع کن.")
+        return
+    if step not in {"export", "import"}:
+        await message.reply_text("فایل را بفرست یا از دکمه‌های بازیابی استفاده کن. برای لغو /cancel را بزن.")
+        return
+    password = message.text
+    if not 12 <= len(password) <= 256 or not password.strip():
+        await message.reply_text("عبارت عبور را با ۱۲ تا ۲۵۶ کاراکتر بفرست.")
+        return
+    if step == "export":
+        try:
+            rows = database_backup.snapshot(ADMIN_DB)
+            data = await asyncio.to_thread(database_backup.export_file, rows, SERVER_CIPHER, password)
+        except (database_backup.BackupError, sqlite3.Error):
+            await message.reply_text("ساخت بکاپ ناموفق بود. حجم داده یا کلید رمزگذاری را بررسی کن.")
+            return
+        clear(context)
+        await message.reply_document(
+            document=data, filename="telegram-vps-backup.tvps",
+            caption="فایل رمزگذاری‌شدهٔ دیتابیس. برای بازیابی روی VPS جدید، فایل و عبارت عبور را لازم داری.",
+        )
+        return
+    try:
+        rows = await asyncio.to_thread(database_backup.restore_file, state["document"], password, SERVER_CIPHER)
+    except database_backup.BackupError:
+        await message.reply_text("فایل یا عبارت عبور معتبر نیست. دوباره تلاش کن.")
+        return
+    confirmation = "db:apply:" + secrets.token_hex(8)
+    state.clear()
+    state.update(step="confirm", rows=rows, confirmation=confirmation, deadline=time.monotonic() + 600)
+    await message.reply_text(
+        f"بکاپ خوانده شد: {len(rows['servers'])} سرور ذخیره‌شده، "
+        f"{len(rows['admins'])} ادمین اضافه‌شده و "
+        f"{sum(len(rows[name]) for name in ('kamatera_accounts', 'linode_accounts', 'hetzner_projects', 'cloudflare_accounts'))} حساب سرویس.\n"
+        "با تأیید، اطلاعات ذخیره‌شدهٔ فعلی ربات با اطلاعات این فایل جایگزین می‌شود.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("تأیید جایگزینی دیتابیس", callback_data=confirmation)],
+            [InlineKeyboardButton("لغو", callback_data="cancel")],
+        ]),
+    )
+
+
 async def handle_text(update, context):
     if not private_admin(update):
         return
     state = context.user_data
     message = update.message
+    if private_owner(update) and "backup" in state:
+        await backup_text(update, context)
+        return
     if private_owner(update) and "cloudflare" in state:
         await cloudflare_text(update, context)
         return
@@ -2087,6 +2221,9 @@ if __name__ == "__main__":
     application.add_handler(CallbackQueryHandler(cancel, pattern=r"^cancel$"))
     application.add_handler(CallbackQueryHandler(select, pattern=r"^(ssh|node|on|off|update)$"))
     application.add_handler(CallbackQueryHandler(
+        backup_button, pattern=r"^(?:backup|db:(?:export|import|apply:[a-f0-9]{16}))$",
+    ))
+    application.add_handler(CallbackQueryHandler(
         cloudflare_button,
         pattern=r"^(?:cloudflare|cf:(?:key|zones)|cp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|zones|list|edit_list|search|dns|add|type:(?:A|AAAA|CNAME)|field:(?:name|content|proxied|ttl)|proxy:(?:on|off)|ttl:(?:1|60|300|600|1800|3600)|delete|confirm))$",
     ))
@@ -2110,6 +2247,7 @@ if __name__ == "__main__":
     application.add_handler(CallbackQueryHandler(server_button, pattern=r"^s:[0-9a-f]{12}:(pick|page|new|connect|delete):[0-9]+$"))
     application.add_handler(CallbackQueryHandler(add_admin, pattern=r"^add_admin$"))
     application.add_handler(MessageHandler(filters.StatusUpdate.USERS_SHARED, shared_admin))
+    application.add_handler(MessageHandler(filters.Document.ALL, backup_document))
     application.add_handler(MessageHandler(filters.TEXT, handle_text))
     application.add_error_handler(report_error)
     application.run_polling(drop_pending_updates=True, allowed_updates=["message", "callback_query"])
