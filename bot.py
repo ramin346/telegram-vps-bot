@@ -1042,6 +1042,7 @@ async def show_linode_details(message, state, token):
         f"منطقه: {instance.get('region', '—')}\nپلن: {instance.get('type', '—')}\nIP: {ips or '—'}",
         reply_markup=linode_keyboard(state, [
             [(label, operation) for operation, label in linode.POWER.items()],
+            [("🗑 حذف سرور", "delete")],
             [("تازه‌سازی وضعیت", "refresh"), ("بازگشت به فهرست", "list")],
         ]),
     )
@@ -1117,6 +1118,13 @@ async def linode_button(update, context):
         if action == "refresh":
             await show_linode_details(message, state, token)
             return
+        if action == "delete" and state["step"] == "instance":
+            state["step"] = "delete_confirm"
+            await message.reply_text(
+                f"سرور «{state['instance_label']}» با شناسهٔ {state['instance']} و داده‌های روی آن برای همیشه حذف می‌شوند.",
+                reply_markup=linode_keyboard(state, [[("تأیید حذف دائمی", "confirm"), ("انصراف", "refresh")]]),
+            )
+            return
         if action in linode.POWER and state["step"] == "instance":
             state.update(step="power_confirm", operation=action)
             await message.reply_text(
@@ -1135,6 +1143,16 @@ async def linode_button(update, context):
             await message.reply_text(
                 f"درخواست ساخت Linode ثبت شد. شناسه: {result.get('id', '—')}. "
                 "برای دیدن IP و وضعیت به «سرورهای موجود» برو."
+            )
+        elif step == "delete_confirm":
+            instance_id = state["instance"]
+            clear(context)
+            await linode.delete_instance(token, instance_id)
+            await message.reply_text(
+                f"سرور Linode با شناسهٔ {instance_id} حذف شد.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("سرورهای موجود", callback_data="li:servers")],
+                ]),
             )
         elif step == "power_confirm":
             await linode.set_power(token, state["instance"], state["operation"])
@@ -1363,7 +1381,7 @@ if __name__ == "__main__":
     application.add_handler(CallbackQueryHandler(cancel, pattern=r"^cancel$"))
     application.add_handler(CallbackQueryHandler(select, pattern=r"^(ssh|node|on|off|update)$"))
     application.add_handler(CallbackQueryHandler(
-        linode_button, pattern=r"^(?:linode|li:(?:key|new|servers)|lp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|boot|shutdown|reboot|refresh|list|confirm))$",
+        linode_button, pattern=r"^(?:linode|li:(?:key|new|servers)|lp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|boot|shutdown|reboot|refresh|list|delete|confirm))$",
     ))
     application.add_handler(CallbackQueryHandler(kamatera_button, pattern=r"^(kamatera|km:(key|new|servers|status|make:[a-f0-9]{16}))$"))
     application.add_handler(CallbackQueryHandler(

@@ -19,7 +19,7 @@ async def request(method, path, token=None, *, params=None, payload=None):
         async with httpx.AsyncClient(base_url=BASE_URL, timeout=25, follow_redirects=False) as client:
             response = await client.request(method, path, headers=headers, params=params, json=payload)
         response.raise_for_status()
-        return response.json()
+        return None if response.status_code == 204 else response.json()
     except httpx.HTTPStatusError as exc:
         raise APIError(exc.response.status_code) from None
     except (httpx.RequestError, ValueError):
@@ -88,3 +88,7 @@ async def set_power(token, instance_id, operation):
     if operation not in POWER:
         raise ValueError("Invalid Linode power operation")
     await request("POST", f"{instance_path(instance_id)}/{operation}", token)
+
+
+async def delete_instance(token, instance_id):
+    await request("DELETE", instance_path(instance_id), token)
