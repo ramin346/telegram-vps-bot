@@ -1,6 +1,6 @@
 import asyncio
 from html import escape
-from ipaddress import IPv6Address
+from ipaddress import IPv6Address, ip_address
 import logging
 import os
 from pathlib import Path
@@ -1307,6 +1307,7 @@ async def show_hetzner_server(message, state, token):
     rows = [[(label, operation) for operation, label in hetzner.POWER.items()]]
     if not (server.get("protection") or {}).get("delete"):
         rows.append([("🗑 حذف سرور", "delete")])
+    rows.append([("🔑 تغییر رمز root", "password")])
     rows.append([("تازه‌سازی", "refresh"), ("بازگشت به فهرست", "list")])
     await message.reply_text(
         f"سرور: {state['name']}\nوضعیت: {server.get('status') or '—'}\n"
@@ -1380,6 +1381,14 @@ async def hetzner_button(update, context):
             return
         elif action == "refresh":
             await show_hetzner_server(message, state, token)
+            return
+        elif action == "password" and state["step"] == "instance":
+            state.pop("nonce", None)
+            state["step"] = "password"
+            await message.reply_text(
+                "رمز فعلی یا رمز اولیهٔ root همین سرور را بفرست. ربات یک رمز جدید می‌سازد "
+                "و آن را همین‌جا به‌صورت قابل کپی می‌فرستد. برای لغو /cancel را بزن."
+            )
             return
         elif action in HETZNER_OPERATIONS and state["step"] == "instance":
             state.update(step="operation_confirm", operation=action)
@@ -1459,10 +1468,16 @@ async def hetzner_confirm(message, context, state, token):
         instance_id = result["server"]["id"]
         password = result.get("root_password")
         if password:
+            instance_state = {"step": "instance", "instance": instance_id}
+            context.user_data["hetzner"] = instance_state
+            controls = hetzner_keyboard(instance_state, [[("🔑 تغییر رمز root", "password")]])
             await message.reply_text(
                 f"درخواست ساخت سرور {instance_id} ثبت شد. رمز اولیهٔ root را ذخیره کن:\n{password}",
                 protect_content=True,
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("کپی رمز", copy_text=CopyTextButton(password))]]),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("کپی رمز", copy_text=CopyTextButton(password))],
+                    *controls.inline_keyboard,
+                ]),
             )
         else:
             await message.reply_text(f"درخواست ساخت سرور {instance_id} ثبت شد. وضعیت را از فهرست سرورها ببین.")
@@ -1487,6 +1502,9 @@ async def hetzner_text(update, context):
     message = update.message
     state = context.user_data["hetzner"]
     value = message.text.strip()
+    if state["step"] == "password":
+        await hetzner_change_password(update, context, state, message.text)
+        return
     if state["step"] == "key":
         await delete_secret_message(message)
         if not re.fullmatch(r"[A-Za-z0-9_-]{16,256}", value):
@@ -1524,6 +1542,121 @@ async def hetzner_text(update, context):
         )
     else:
         await message.reply_text("از دکمه‌های همین مرحله استفاده کن یا /cancel را بزن.")
+
+
+PASSWORD_PROMPT = re.compile(
+    rb"(?:^|[\r\n])[ \t]*(?:(?:\(current\)|current|old)[ \t]+(?:unix[ \t]+)?password|"
+    rb"new(?:[ \t]+unix)?[ \t]+password|(?:retype|repeat|confirm)[ \t]+(?:new[ \t]+)?"
+    rb"(?:unix[ \t]+)?password(?:[ \t]+again)?):[ \t]*$",
+    re.IGNORECASE,
+)
+
+
+def change_root_password(host, current, replacement):
+    """Return whether SSH verified the change and whether the new password was submitted twice."""
+    phase = "current"
+    submitted = False
+    try:
+        with connect(host, 22, "root", current) as client:
+            with client.get_transport().open_session(timeout=10) as channel:
+                channel.settimeout(10)
+                channel.get_pty(term="dumb")
+                channel.set_combine_stderr(True)
+                channel.exec_command("LC_ALL=C passwd")
+                deadline = time.monotonic() + 30
+                pending = b""
+                while time.monotonic() < deadline:
+                    if not channel.recv_ready():
+                        if channel.exit_status_ready():
+                            break
+                        time.sleep(0.05)
+                        continue
+                    received = channel.recv(4096)
+                    if not received:
+                        break
+                    pending = (pending + received)[-4096:]
+                    match = PASSWORD_PROMPT.search(pending)
+                    if not match:
+                        continue
+                    prompt = match.group().strip().lower()
+                    pending = b""
+                    if phase == "current" and prompt.startswith((b"current", b"(current)", b"old")):
+                        channel.sendall(current.encode() + b"\n")
+                        phase = "new"
+                    elif phase in {"current", "new"} and prompt.startswith(b"new"):
+                        channel.sendall(replacement.encode() + b"\n")
+                        phase = "repeat"
+                    elif phase == "repeat" and prompt.startswith((b"retype", b"repeat", b"confirm")):
+                        submitted = True
+                        phase = "done"
+                        channel.sendall(replacement.encode() + b"\n")
+    except (OSError, EOFError, paramiko.SSHException):
+        pass
+
+    if submitted:
+        try:
+            # Expired accounts cannot execute a command without a PTY.
+            with connect(host, 22, "root", replacement) as client:
+                status, _ = run(client, "true", timeout=10)
+                return status == 0, True
+        except (OSError, EOFError, paramiko.SSHException):
+            pass
+    return False, submitted
+
+
+async def hetzner_change_password(update, context, state, current):
+    message = update.message
+    await delete_secret_message(message)
+    if not current or any(char in current for char in "\r\n\x00"):
+        await message.reply_text("رمز فعلی root را در یک خط بفرست.")
+        return
+    instance = state["instance"]
+    state["step"] = "password_running"
+    try:
+        token = hetzner_token(update.effective_user.id)
+        if not token:
+            raise hetzner.APIError()
+        server = await hetzner.server_details(token, instance)
+    except (hetzner.APIError, InvalidToken):
+        state["step"] = "password"
+        await message.reply_text("دریافت اطلاعات سرور ناموفق بود.")
+        return
+    public = server.get("public_net") or {}
+    hosts = []
+    for version in ("ipv4", "ipv6"):
+        value = (public.get(version) or {}).get("ip")
+        if value:
+            try:
+                hosts.append(str(ip_address(value)))
+            except ValueError:
+                continue
+    if not hosts:
+        clear(context)
+        await message.reply_text("سرور هنوز IP عمومی ندارد. پس از آماده‌شدن دوباره تلاش کن.")
+        return
+
+    replacement = "Aa9!" + secrets.token_urlsafe(21)
+    await message.reply_text("در حال تغییر و بررسی رمز root از طریق SSH…")
+    verified, submitted = await asyncio.to_thread(change_root_password, hosts[0], current, replacement)
+    if not submitted:
+        state["step"] = "password"
+        await message.reply_text(
+            "تغییر رمز انجام نشد. آماده‌بودن VPS، باز بودن پورت ۲۲ و درستی رمز فعلی را بررسی کن و دوباره بفرست."
+        )
+        return
+    clear(context)
+    title = (
+        "رمز جدید root تنظیم شد و ورود با آن تأیید شد."
+        if verified else "رمز زیر به سرور ارسال شد، اما ورود با آن تأیید نشد. پیش از تکرار، این رمز را امتحان کن."
+    )
+    await message.reply_text(
+        f"{title}\n\n{replacement}",
+        protect_content=True,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("کپی رمز", copy_text=CopyTextButton(replacement))],
+            [InlineKeyboardButton("سرورهای موجود", callback_data="he:servers")],
+        ]),
+    )
 
 
 async def handle_text(update, context):
@@ -1651,7 +1784,7 @@ if __name__ == "__main__":
     application.add_handler(CallbackQueryHandler(select, pattern=r"^(ssh|node|on|off|update)$"))
     application.add_handler(CallbackQueryHandler(
         hetzner_button,
-        pattern=r"^(?:hetzner|he:(?:key|new|servers)|hp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|poweron|shutdown|reboot|refresh|list|delete|confirm))$",
+        pattern=r"^(?:hetzner|he:(?:key|new|servers)|hp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|poweron|shutdown|reboot|refresh|list|delete|password|confirm))$",
     ))
     application.add_handler(CallbackQueryHandler(
         linode_button, pattern=r"^(?:linode|li:(?:key|new|servers)|lp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|boot|shutdown|reboot|refresh|list|delete|confirm))$",
