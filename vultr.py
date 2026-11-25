@@ -1,4 +1,5 @@
 import asyncio
+import re
 from urllib.parse import quote
 
 import httpx
@@ -10,8 +11,9 @@ NON_LINUX = {"iso", "snapshot", "backup", "application", "marketplace_app", "win
 
 
 class APIError(Exception):
-    def __init__(self, status=None):
+    def __init__(self, status=None, *, ip_restricted=False):
         self.status = status
+        self.ip_restricted = ip_restricted
         super().__init__("Vultr API request failed")
 
 
@@ -25,7 +27,17 @@ async def request(method, path, token=None, *, params=None, payload=None):
             return {}
         data = response.json()
     except httpx.HTTPStatusError as exc:
-        raise APIError(exc.response.status_code) from None
+        blocked = False
+        if exc.response.status_code in {401, 403}:
+            try:
+                body = exc.response.json()
+                reason = str(body.get("error") or "").lower() if isinstance(body, dict) else ""
+                blocked = "ip" in reason and any(word in reason for word in (
+                    "allowlist", "white list", "whitelist", "not allowed", "not authorized", "not permitted",
+                ))
+            except ValueError:
+                pass
+        raise APIError(exc.response.status_code, ip_restricted=blocked) from None
     except (httpx.RequestError, ValueError):
         raise APIError() from None
     if not isinstance(data, dict):
@@ -109,3 +121,20 @@ async def change_instance(token, instance_id, operation):
         await request("POST", f"{path}/{operation}", token)
     else:
         raise ValueError("Invalid Vultr operation")
+
+
+def parse_api_key(value):
+    parts = value.strip().split(None, 1)
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        value = parts[1]
+    else:
+        value = value.strip()
+    if not re.fullmatch(r"[A-Za-z0-9._~+/=-]{16,512}", value):
+        raise ValueError("Invalid API key format")
+    return value
+
+
+async def verify_api_key(token):
+    result = await request("GET", "/instances", token)
+    if not isinstance(result.get("instances"), list):
+        raise APIError()

@@ -2485,13 +2485,32 @@ async def vultr_text(update, context):
     step = state.get("step")
     if step == "key":
         await delete_secret_message(message)
-        if not re.fullmatch(r"[A-Za-z0-9_-]{16,256}", value):
-            await message.reply_text("API Key را در یک خط بفرست.")
+        try:
+            value = vultr.parse_api_key(value)
+        except ValueError:
+            await message.reply_text(
+                "مقدار کامل API Key را در یک خط بفرست. نام‌هایی مثل mybot که در فهرست کلیدها می‌بینی، مقدار کلید نیستند."
+            )
             return
         try:
-            await vultr.request("GET", "/instances", value, params={"per_page": 1})
-        except vultr.APIError:
-            await message.reply_text("کلید تأیید نشد. کلید و مجاز بودن IP خروجی ربات در Vultr را بررسی کن.")
+            await vultr.verify_api_key(value)
+        except vultr.APIError as exc:
+            if exc.ip_restricted:
+                reason = "Vultr دسترسی IP را رد کرد. IP عمومی خروجی VPS ربات را در Access Control List مجاز کن."
+            elif exc.status in {401, 403}:
+                reason = (
+                    "Vultr دسترسی را رد کرد. مقدار کامل کلید، مجوز دسترسی به Instances و "
+                    "مجاز بودن IP عمومی خروجی VPS ربات در Access Control List را بررسی کن."
+                )
+            elif exc.status == 429:
+                reason = "Vultr تعداد درخواست‌ها را محدود کرده است. کمی بعد دوباره تلاش کن."
+            elif exc.status is None or exc.status >= 500:
+                reason = "ارتباط با API ولتر ناموفق بود. بعداً دوباره تلاش کن."
+            else:
+                reason = "Vultr درخواست بررسی کلید را نپذیرفت."
+            if exc.status:
+                reason += f" (HTTP {exc.status})"
+            await message.reply_text(reason)
             return
         with ADMIN_DB:
             ADMIN_DB.execute(
