@@ -25,6 +25,7 @@ from telegram.ext import (
 )
 
 import kamatera
+import linode
 
 ROOT = Path(__file__).resolve().parent
 SCRIPT = "https://github.com/PasarGuard/scripts/raw/main/pg-node.sh"
@@ -191,8 +192,10 @@ def init_servers(db):
                 user_id INTEGER PRIMARY KEY, credentials BLOB NOT NULL, command_id TEXT
             )
         """)
+    with db:
+        db.execute("CREATE TABLE IF NOT EXISTS linode_accounts (user_id INTEGER PRIMARY KEY, token BLOB NOT NULL)")
     has_saved_secrets = db.execute(
-        "SELECT 1 FROM servers WHERE secret IS NOT NULL UNION ALL SELECT 1 FROM kamatera_accounts LIMIT 1"
+        "SELECT 1 FROM servers WHERE secret IS NOT NULL UNION ALL SELECT 1 FROM kamatera_accounts UNION ALL SELECT 1 FROM linode_accounts LIMIT 1"
     ).fetchone()
     if not key_path.exists() and not has_saved_secrets:
         try:
@@ -249,7 +252,10 @@ def menu(owner):
     rows.append([InlineKeyboardButton(LABELS[name], callback_data=name) for name in ("on", "off")])
     rows.append([InlineKeyboardButton("🖥 سرورهای من", callback_data="my_servers")])
     if owner:
-        rows.append([InlineKeyboardButton("☁️ سرور کاماترا", callback_data="kamatera")])
+        rows.append([
+            InlineKeyboardButton("☁️ سرور کاماترا", callback_data="kamatera"),
+            InlineKeyboardButton("☁️ سرور Linode", callback_data="linode"),
+        ])
         rows.append([
             InlineKeyboardButton("➕ افزودن ادمین", callback_data="add_admin"),
             InlineKeyboardButton(LABELS["update"], callback_data="update"),
@@ -982,11 +988,268 @@ async def kamatera_text(update, context):
         )
 
 
+LINODE_PICKERS = {
+    "region": "منطقهٔ Linode را انتخاب کن.",
+    "image": "ایمیج سیستم‌عامل را انتخاب کن.",
+    "type": "پلن Linode را انتخاب کن.",
+    "servers": "یک VPS را انتخاب کن.",
+}
+
+
+def linode_token(user_id):
+    row = ADMIN_DB.execute("SELECT token FROM linode_accounts WHERE user_id = ?", (user_id,)).fetchone()
+    return SERVER_CIPHER.decrypt(row[0]).decode() if row else None
+
+
+def linode_keyboard(state, rows):
+    nonce = state["nonce"] = secrets.token_hex(8)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(label, callback_data=f"lp:{nonce}:{action}") for label, action in row]
+        for row in rows
+    ])
+
+
+async def show_linode_picker(message, state, page=0):
+    choices = state["choices"]
+    offset = page * 8
+    rows = [
+        [(label[:64], f"pick:{index}")]
+        for index, (_, label) in enumerate(choices[offset:offset + 8], offset)
+    ]
+    navigation = []
+    if page:
+        navigation.append(("قبلی", f"page:{page - 1}"))
+    if offset + 8 < len(choices):
+        navigation.append(("بعدی", f"page:{page + 1}"))
+    if navigation:
+        rows.append(navigation)
+    markup = linode_keyboard(state, rows)
+    keyboard = [*markup.inline_keyboard, [InlineKeyboardButton("منوی Linode", callback_data="linode")]]
+    await message.reply_text(
+        LINODE_PICKERS[state["step"]] if choices else "گزینه‌ای برای نمایش پیدا نشد.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def show_linode_details(message, state, token):
+    instance = await linode.details(token, state["instance"])
+    state.update(step="instance", instance_label=str(instance.get("label") or state["instance"])[:120])
+    ips = ", ".join(str(ip) for ip in (instance.get("ipv4") or []))
+    if instance.get("ipv6"):
+        ips = f"{ips}, {instance['ipv6']}" if ips else instance["ipv6"]
+    await message.reply_text(
+        f"سرور: {state['instance_label']}\nوضعیت: {instance.get('status', '—')}\n"
+        f"منطقه: {instance.get('region', '—')}\nپلن: {instance.get('type', '—')}\nIP: {ips or '—'}",
+        reply_markup=linode_keyboard(state, [
+            [(label, operation) for operation, label in linode.POWER.items()],
+            [("تازه‌سازی وضعیت", "refresh"), ("بازگشت به فهرست", "list")],
+        ]),
+    )
+
+
+async def linode_button(update, context):
+    query = update.callback_query
+    if not private_owner(update):
+        await query.answer()
+        return
+    message = query.message
+    user_id = update.effective_user.id
+    action = query.data
+    state = context.user_data.get("linode", {})
+    if action.startswith("lp:"):
+        _, nonce, action = action.split(":", 2)
+        if nonce != state.get("nonce"):
+            await query.answer("این منو بسته شده است.")
+            return
+    else:
+        clear(context)
+        state = {}
+    await query.answer()
+    if action == "linode":
+        await message.reply_text("مدیریت Linode", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("ثبت یا تعویض توکن", callback_data="li:key")],
+            [InlineKeyboardButton("ساخت VPS", callback_data="li:new"),
+             InlineKeyboardButton("سرورهای موجود", callback_data="li:servers")],
+            [InlineKeyboardButton("بازگشت", callback_data="cancel")],
+        ]))
+        return
+    if action == "li:key":
+        context.user_data["linode"] = {"step": "key"}
+        await message.reply_text(
+            "Personal Access Token با دسترسی Linodes: Read/Write را بفرست. "
+            "ربات تلاش می‌کند پیام را حذف کند. چت ربات رمزنگاری سرتاسری ندارد."
+        )
+        return
+    try:
+        token = linode_token(user_id)
+    except InvalidToken:
+        token = None
+    if not token:
+        await message.reply_text("ابتدا توکن Linode را ثبت کن.")
+        return
+    try:
+        if action in {"li:new", "li:servers"}:
+            if action == "li:new":
+                rows = await linode.regions()
+                state.update(step="region", form={}, choices=[
+                    (row["id"], f"{row.get('label') or row['id']} · {row['id']}") for row in rows
+                ])
+            else:
+                rows = await linode.catalog("/linode/instances", token)
+                state.update(step="servers", choices=[
+                    (row["id"], f"{row.get('label') or row['id']} · {row.get('status', '—')}") for row in rows
+                ])
+            context.user_data["linode"] = state
+            await show_linode_picker(message, state)
+            return
+        if action.startswith("page:"):
+            page = int(action.split(":")[1])
+            if page * 8 < len(state["choices"]):
+                await show_linode_picker(message, state, page)
+            return
+        if action.startswith("pick:"):
+            await linode_pick(message, state, token, int(action.split(":")[1]))
+            return
+        if action == "list":
+            state["step"] = "servers"
+            await show_linode_picker(message, state)
+            return
+        if action == "refresh":
+            await show_linode_details(message, state, token)
+            return
+        if action in linode.POWER and state["step"] == "instance":
+            state.update(step="power_confirm", operation=action)
+            await message.reply_text(
+                f"عملیات «{linode.POWER[action]}» روی «{state['instance_label']}» انجام شود؟",
+                reply_markup=linode_keyboard(state, [[("تأیید عملیات", "confirm"), ("انصراف", "refresh")]]),
+            )
+            return
+        if action != "confirm":
+            return
+        step = state["step"]
+        state.pop("nonce", None)
+        if step == "create_confirm":
+            form = state.pop("form")
+            clear(context)
+            result = await linode.create(token, form)
+            await message.reply_text(
+                f"درخواست ساخت Linode ثبت شد. شناسه: {result.get('id', '—')}. "
+                "برای دیدن IP و وضعیت به «سرورهای موجود» برو."
+            )
+        elif step == "power_confirm":
+            await linode.set_power(token, state["instance"], state["operation"])
+            await message.reply_text(
+                "درخواست تغییر وضعیت ثبت شد.",
+                reply_markup=linode_keyboard(state, [[("تازه‌سازی وضعیت", "refresh")]]),
+            )
+    except linode.APIError as exc:
+        if action == "confirm" and (exc.status is None or exc.status >= 500):
+            text = "نتیجهٔ درخواست مشخص نیست. پیش از تکرار، وضعیت را در «سرورهای موجود» یا پنل Linode بررسی کن."
+        else:
+            text = "دریافت اطلاعات یا اجرای درخواست Linode ناموفق بود."
+            if exc.status:
+                text += f" HTTP {exc.status}"
+        await message.reply_text(text)
+
+
+async def linode_pick(message, state, token, index):
+    choices = state["choices"]
+    if index >= len(choices):
+        return
+    value = choices[index][0]
+    step = state["step"]
+    if step == "servers":
+        state["instance"] = value
+        await show_linode_details(message, state, token)
+        return
+    form = state["form"]
+    if step == "region":
+        plans, images = await linode.region_options(value)
+        if not plans or not images:
+            await message.reply_text("برای این منطقه پلن یا ایمیج سازگار پیدا نشد. منطقهٔ دیگری را انتخاب کن.")
+            return
+        form["region"] = value
+        state.update(step="image", plans=plans, choices=[(row, str(row.get("label") or row["id"])) for row in images])
+        await show_linode_picker(message, state)
+        return
+    if step == "image":
+        form["image"] = value["id"]
+        state["image_label"] = str(value.get("label") or value["id"])[:120]
+        plans = [row for row in state["plans"] if row.get("disk", 0) >= (value.get("size") or 0)]
+        if not plans:
+            await message.reply_text("برای این ایمیج پلن سازگار پیدا نشد. ایمیج دیگری انتخاب کن.")
+            return
+        state.update(step="type", choices=[
+            (row, f"{row.get('label') or row['id']} · ${linode.price(row, form['region'])['monthly']:g}/mo")
+            for row in plans
+        ])
+        await show_linode_picker(message, state)
+        return
+    form["type"] = value["id"]
+    state.update(step="name", plan=value)
+    state.pop("nonce")
+    await message.reply_text("نام VPS را بفرست. برای لغو /cancel را بزن.")
+
+
+async def linode_text(update, context):
+    message = update.message
+    state = context.user_data["linode"]
+    step = state["step"]
+    value = message.text.strip()
+    if step == "key":
+        await delete_secret_message(message)
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,256}", value):
+            await message.reply_text("توکن Linode را در یک خط بفرست.")
+            return
+        try:
+            await linode.verify(value)
+        except linode.APIError:
+            await message.reply_text("توکن تأیید نشد. توکن و دسترسی Linodes را بررسی کن.")
+            return
+        with ADMIN_DB:
+            ADMIN_DB.execute(
+                "INSERT INTO linode_accounts VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET token=excluded.token",
+                (update.effective_user.id, SERVER_CIPHER.encrypt(value.encode())),
+            )
+        clear(context)
+        await message.reply_text(
+            "توکن Linode تأیید و رمزگذاری شد.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("منوی Linode", callback_data="linode")]]),
+        )
+    elif step == "name":
+        if not re.fullmatch(r"[A-Za-z](?:(?!--|__|\.\.)[A-Za-z0-9_.-]){2,63}", value):
+            await message.reply_text("نامی بین ۳ تا ۶۴ کاراکتر بفرست که با حرف انگلیسی شروع شود. خط تیره، نقطه و زیرخطِ تکراری مجاز نیست.")
+            return
+        state["form"]["label"] = value
+        state["step"] = "password"
+        await message.reply_text("رمز root را بفرست. یک رمز قوی بین ۷ تا ۱۲۸ کاراکتر انتخاب کن. ربات تلاش می‌کند پیام را حذف کند.")
+    elif step == "password":
+        await delete_secret_message(message)
+        if not 7 <= len(value) <= 128:
+            await message.reply_text("رمز باید بین ۷ و ۱۲۸ کاراکتر باشد.")
+            return
+        form = state["form"]
+        form["root_pass"] = value
+        price = linode.price(state["plan"], form["region"])
+        state["step"] = "create_confirm"
+        await message.reply_text(
+            f"سرور: {form['label']}\nمنطقه: {form['region']}\nایمیج: {state['image_label']}\n"
+            f"پلن: {state['plan'].get('label') or form['type']}\n"
+            f"قیمت اعلام‌شده: ${price['hourly']:g}/ساعت، ${price['monthly']:g}/ماه (USD)",
+            reply_markup=linode_keyboard(state, [[("تأیید ساخت و هزینه", "confirm")]]),
+        )
+    else:
+        await message.reply_text("از دکمه‌های همین مرحله استفاده کن یا /cancel را بزن.")
+
+
 async def handle_text(update, context):
     if not private_admin(update):
         return
     state = context.user_data
     message = update.message
+    if private_owner(update) and "linode" in state:
+        await linode_text(update, context)
+        return
     if private_owner(update) and "kamatera" in state:
         await kamatera_text(update, context)
         return
@@ -1099,6 +1362,9 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("update", update_command))
     application.add_handler(CallbackQueryHandler(cancel, pattern=r"^cancel$"))
     application.add_handler(CallbackQueryHandler(select, pattern=r"^(ssh|node|on|off|update)$"))
+    application.add_handler(CallbackQueryHandler(
+        linode_button, pattern=r"^(?:linode|li:(?:key|new|servers)|lp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|boot|shutdown|reboot|refresh|list|confirm))$",
+    ))
     application.add_handler(CallbackQueryHandler(kamatera_button, pattern=r"^(kamatera|km:(key|new|servers|status|make:[a-f0-9]{16}))$"))
     application.add_handler(CallbackQueryHandler(
         kamatera_create_button,
