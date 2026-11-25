@@ -37,16 +37,46 @@ async def options(token, path):
     return await request("GET", "/server/options/" + path, token=token)
 
 
-async def create_server(token, form):
-    result = await request("POST", "/server", token=token, payload={
-        **form, "billing": "hourly", "managed": False, "backup": False,
-        "power": True, "network_name_0": "wan",
-    })
+def parse_command_id(result):
     if isinstance(result, list) and len(result) == 1:
         result = result[0]
     if not isinstance(result, (int, str)) or not str(result).isascii() or not str(result).isdigit():
         raise APIError()
     return str(result)
+
+
+async def create_server(token, form):
+    result = await request("POST", "/server", token=token, payload={
+        **form, "billing": "hourly", "managed": False, "backup": False,
+        "power": True, "network_name_0": "wan",
+    })
+    return parse_command_id(result)
+
+
+async def list_servers(token):
+    result = await request("GET", "/servers", token=token)
+    if not isinstance(result, list) or any(
+        not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"]
+        for row in result
+    ):
+        raise APIError()
+    return result
+
+
+async def server_details(token, server_id):
+    result = await request("GET", "/server/" + quote(server_id, safe=""), token=token)
+    if not isinstance(result, dict) or result.get("id") != server_id:
+        raise APIError()
+    return result
+
+
+async def set_power(token, server_id, power):
+    if power not in {"on", "off", "restart"}:
+        raise ValueError("Invalid Kamatera power action")
+    result = await request(
+        "PUT", "/server/" + quote(server_id, safe="") + "/power", token=token, payload={"power": power},
+    )
+    return parse_command_id(result)
 
 
 async def command_status(token, command_id):

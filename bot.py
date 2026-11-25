@@ -588,6 +588,7 @@ async def kamatera_button(update, context):
         await message.reply_text("مدیریت کاماترا", reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("ثبت یا تعویض کلید API", callback_data="km:key")],
             [InlineKeyboardButton("ساخت VPS", callback_data="km:new")],
+            [InlineKeyboardButton("سرورهای موجود", callback_data="km:servers")],
             [InlineKeyboardButton("وضعیت آخرین درخواست", callback_data="km:status")],
             [InlineKeyboardButton("بازگشت", callback_data="cancel")],
         ]))
@@ -605,6 +606,11 @@ async def kamatera_button(update, context):
         return
     try:
         token = await kamatera_token(user_id)
+        if action == "km:servers":
+            servers = await kamatera.list_servers(token)
+            state["kamatera_servers"] = {"servers": servers}
+            await show_kamatera_servers(message, state["kamatera_servers"])
+            return
         if action == "km:status":
             if not account[1]:
                 await message.reply_text("هنوز درخواست ساختی ثبت نشده است.")
@@ -632,6 +638,130 @@ async def kamatera_button(update, context):
     state["kamatera"] = {"step": "location", "locations": locations, "form": {}}
     await message.reply_text("کد دیتاسنتر را از فهرست زیر بفرست.")
     await send_code(message, "\n".join(f"{code}  {label}" for code, label in locations.items()))
+
+
+POWER_LABELS = {"on": "روشن کردن", "off": "خاموش کردن", "restart": "ری‌استارت"}
+POWER_STATUS = {"on": "روشن", "off": "خاموش"}
+
+
+def kamatera_controls(state, rows):
+    token = state["token"] = secrets.token_hex(8)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(label, callback_data=f"kms:{token}:{action}") for label, action in row]
+        for row in rows
+    ])
+
+
+async def show_kamatera_servers(message, state, page=0):
+    servers = state["servers"]
+    offset = page * 8
+    rows = [
+        [(f"{row.get('name') or row['id']} · {POWER_STATUS.get(row.get('power'), 'نامشخص')}"[:64], f"detail:{index}")]
+        for index, row in enumerate(servers[offset:offset + 8], offset)
+    ]
+    navigation = []
+    if page:
+        navigation.append(("قبلی", f"page:{page - 1}"))
+    if offset + 8 < len(servers):
+        navigation.append(("بعدی", f"page:{page + 1}"))
+    if navigation:
+        rows.append(navigation)
+    markup = kamatera_controls(state, rows) if rows else None
+    keyboard = list(markup.inline_keyboard) if markup else []
+    keyboard.append([
+        InlineKeyboardButton("به‌روزرسانی فهرست", callback_data="km:servers"),
+        InlineKeyboardButton("منوی کاماترا", callback_data="kamatera"),
+    ])
+    await message.reply_text(
+        "سرور کاماترا را انتخاب کن." if servers else "برای این حساب سرور کاماترایی پیدا نشد.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def kamatera_server_button(update, context):
+    query = update.callback_query
+    if not private_owner(update):
+        await query.answer()
+        return
+    state = context.user_data.get("kamatera_servers")
+    _, token, action, value = query.data.split(":")
+    if not state or token != state["token"]:
+        await query.answer("این منو بسته شده است.")
+        return
+    await query.answer()
+    message = query.message
+    if action == "page":
+        await show_kamatera_servers(message, state, int(value))
+        return
+    index = int(value) if action == "detail" else state["selected"]
+    server = state["servers"][index]
+    server_id = server["id"]
+    name = str(server.get("name") or server_id)[:120]
+    if action == "power":
+        state["power"] = value
+        await message.reply_text(
+            f"عملیات «{POWER_LABELS[value]}» روی «{name}» انجام شود؟",
+            reply_markup=kamatera_controls(state, [
+                [("تأیید عملیات", "confirm:0"), ("انصراف", f"detail:{index}")],
+            ]),
+        )
+        return
+    if action == "confirm":
+        power = state.pop("power")
+        state["token"] = None
+    try:
+        bearer = await kamatera_token(update.effective_user.id)
+        if action == "confirm":
+            command_id = await kamatera.set_power(bearer, server_id, power)
+            state["command_id"] = command_id
+            await message.reply_text(
+                f"درخواست ثبت شد. شناسهٔ عملیات: {command_id}",
+                reply_markup=kamatera_controls(state, [
+                    [("وضعیت عملیات", "status:0"), ("وضعیت سرور", f"detail:{index}")],
+                ]),
+            )
+            return
+        if action == "status":
+            result = await kamatera.command_status(bearer, state["command_id"])
+            status = {"complete": "انجام شد", "error": "ناموفق بود"}.get(result["status"], "در صف یا در حال انجام")
+            await message.reply_text(
+                f"عملیات {state['command_id']} — {status}",
+                reply_markup=kamatera_controls(state, [
+                    [("بررسی دوباره", "status:0"), ("وضعیت سرور", f"detail:{index}")],
+                ]),
+            )
+            return
+        detail = await kamatera.server_details(bearer, server_id)
+    except (kamatera.APIError, InvalidToken) as exc:
+        if action == "confirm":
+            status = exc.status if isinstance(exc, kamatera.APIError) else None
+            text = (
+                f"درخواست با خطای HTTP {status} رد شد." if status and 400 <= status < 500
+                else "نتیجهٔ درخواست مشخص نیست. وضعیت سرور یا صف پنل کاماترا را بررسی کن."
+            )
+        else:
+            text = "دریافت اطلاعات سرور از کاماترا ناموفق بود."
+        await message.reply_text(text, reply_markup=kamatera_controls(state, [[("بازگشت به فهرست", f"page:{index // 8}")]]))
+        return
+
+    state["selected"] = index
+    networks = detail.get("networks") or []
+    addresses = [
+        ip for network in networks if isinstance(network, dict)
+        for ip in (network.get("ips") or []) if isinstance(ip, str)
+    ]
+    await message.reply_text(
+        f"سرور: {str(detail.get('name') or name)[:120]}\n"
+        f"وضعیت: {POWER_STATUS.get(detail.get('power'), 'نامشخص')}\n"
+        f"دیتاسنتر: {detail.get('datacenter') or '—'}\n"
+        f"آدرس‌ها: {', '.join(addresses)[:1500] or '—'}\n"
+        f"دیسک (GB): {detail.get('disks') or '—'}\n"
+        f"تعرفه: {detail.get('billing') or '—'}",
+        reply_markup=kamatera_controls(state, [
+            [(label, f"power:{power}") for power, label in POWER_LABELS.items()],
+            [("تازه‌سازی وضعیت", f"detail:{index}"), ("بازگشت به فهرست", f"page:{index // 8}")],
+        ]),
+    )
 
 
 async def delete_secret_message(message):
@@ -882,7 +1012,11 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("update", update_command))
     application.add_handler(CallbackQueryHandler(cancel, pattern=r"^cancel$"))
     application.add_handler(CallbackQueryHandler(select, pattern=r"^(ssh|node|on|off|update)$"))
-    application.add_handler(CallbackQueryHandler(kamatera_button, pattern=r"^(kamatera|km:(key|new|status|make:[a-f0-9]{16}))$"))
+    application.add_handler(CallbackQueryHandler(kamatera_button, pattern=r"^(kamatera|km:(key|new|servers|status|make:[a-f0-9]{16}))$"))
+    application.add_handler(CallbackQueryHandler(
+        kamatera_server_button,
+        pattern=r"^kms:[a-f0-9]{16}:(?:(?:page|detail):[0-9]+|power:(?:on|off|restart)|(?:confirm|status):0)$",
+    ))
     application.add_handler(CallbackQueryHandler(my_servers, pattern=r"^my_servers$"))
     application.add_handler(CallbackQueryHandler(server_button, pattern=r"^s:[0-9a-f]{12}:(pick|page|new|connect|delete):[0-9]+$"))
     application.add_handler(CallbackQueryHandler(add_admin, pattern=r"^add_admin$"))
