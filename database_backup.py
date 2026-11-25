@@ -14,6 +14,8 @@ SUFFIX = ".tvps"
 TABLES = {
     "admins": (("user_id", "i"),),
     "servers": (("id", "i"), ("user_id", "i"), ("host", "t"), ("port", "i"), ("username", "t"), ("secret", "s?")),
+    "server_folders": (("id", "i"), ("user_id", "i"), ("name", "t")),
+    "server_folder_members": (("server_id", "i"), ("folder_id", "i")),
     "kamatera_accounts": (("user_id", "i"), ("credentials", "s"), ("command_id", "t?")),
     "linode_accounts": (("user_id", "i"), ("token", "s")),
     "hetzner_projects": (("id", "i"), ("user_id", "i"), ("name", "t"), ("token", "s")),
@@ -70,10 +72,15 @@ def restore_file(data, password, storage_cipher):
     try:
         payload = password_cipher(password, data[len(MAGIC):end]).decrypt(data[end:])
         contents = json.loads(payload)
-        optional = {"dns_rotations", "vultr_accounts"}
+        optional = {"dns_rotations", "vultr_accounts", "server_folders", "server_folder_members"}
         if not isinstance(contents, dict) or not TABLES.keys() - optional <= contents.keys() <= TABLES.keys():
             raise ValueError
         rows = {table: restore_rows(contents.get(table, []), columns, storage_cipher) for table, columns in TABLES.items()}
+        servers = {row[0]: row[1] for row in rows["servers"]}
+        folders = {row[0]: row[1] for row in rows["server_folders"]}
+        for server_id, folder_id in rows["server_folder_members"]:
+            if server_id not in servers or folder_id not in folders or servers[server_id] != folders[folder_id]:
+                raise ValueError
         for fields in rows["dns_rotations"]:
             rotation = dns_rotation.Rotation(*fields)
             if rotation.status not in {"active", "done", "failed", "cancelled"} or rotation.due_at > 253402200000:
@@ -111,8 +118,9 @@ def restore_rows(entries, columns, cipher):
 
 def replace_data(db, rows):
     with db:
+        for table in reversed(TABLES):
+            db.execute(f"DELETE FROM {table}")
         for table, columns in TABLES.items():
             names = ", ".join(name for name, _ in columns)
             markers = ", ".join("?" for _ in columns)
-            db.execute(f"DELETE FROM {table}")
             db.executemany(f"INSERT INTO {table} ({names}) VALUES ({markers})", rows[table])

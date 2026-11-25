@@ -174,6 +174,7 @@ def load_admins():
     path = Path.home() / ".local" / "share" / "telegram-vps-bot"
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     db = sqlite3.connect(path / "admins.sqlite3")
+    db.execute("PRAGMA foreign_keys = ON")
     with db:
         db.execute("CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY)")
     return db, {row[0] for row in db.execute("SELECT user_id FROM admins")}
@@ -224,6 +225,22 @@ def init_servers(db):
         db.execute("CREATE TABLE IF NOT EXISTS cloudflare_accounts (user_id INTEGER PRIMARY KEY, token BLOB NOT NULL)")
     with db:
         db.execute("CREATE TABLE IF NOT EXISTS vultr_accounts (user_id INTEGER PRIMARY KEY, token BLOB NOT NULL)")
+    with db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS server_folders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                name TEXT COLLATE NOCASE NOT NULL,
+                UNIQUE (user_id, name)
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS server_folder_members (
+                server_id INTEGER PRIMARY KEY REFERENCES servers(id) ON DELETE CASCADE,
+                folder_id INTEGER NOT NULL REFERENCES server_folders(id) ON DELETE CASCADE
+            )
+        """)
+        db.execute("CREATE INDEX IF NOT EXISTS server_folder_members_by_folder ON server_folder_members(folder_id)")
     dns_rotation.init(db)
     has_saved_secrets = db.execute("""
         SELECT 1 FROM servers WHERE secret IS NOT NULL
@@ -363,21 +380,110 @@ async def ask_address(message):
     )
 
 
+def server_list_token(state):
+    state["servers_token"] = secrets.token_hex(6)
+    return state["servers_token"]
+
+
+async def show_server_folders(update, context, page=0, *, moving=None):
+    message = update.callback_query.message if update.callback_query else update.message
+    state = context.user_data
+    user_id = update.effective_user.id
+    folders = ADMIN_DB.execute("""
+        SELECT id, name FROM server_folders WHERE user_id = ? ORDER BY id LIMIT 9 OFFSET ?
+    """, (user_id, page * 8)).fetchall()
+    token = server_list_token(state)
+    if moving is None:
+        state.pop("moving_server", None)
+        state.pop("folder_id", None)
+        rows = [[InlineKeyboardButton("📁 ساخت پوشه", callback_data=f"s:{token}:folder_new:0")]]
+        verb = "folder"
+        page_verb = "folders_page"
+    else:
+        state["moving_server"] = moving
+        rows = []
+        verb = "move_to"
+        page_verb = "move_page"
+    rows.append([InlineKeyboardButton("📄 بدون پوشه", callback_data=f"s:{token}:{verb}:0")])
+    rows.extend(
+        [InlineKeyboardButton(f"📂 {name}", callback_data=f"s:{token}:{verb}:{folder_id}")]
+        for folder_id, name in folders[:8]
+    )
+    navigation = []
+    if page:
+        navigation.append(InlineKeyboardButton("قبلی", callback_data=f"s:{token}:{page_verb}:{page - 1}"))
+    if len(folders) > 8:
+        navigation.append(InlineKeyboardButton("بعدی", callback_data=f"s:{token}:{page_verb}:{page + 1}"))
+    if navigation:
+        rows.append(navigation)
+    back = "cancel" if moving is None else f"s:{token}:pick:{moving}"
+    rows.append([InlineKeyboardButton("بازگشت", callback_data=back)])
+    await message.reply_text(
+        "سرورهای من" if moving is None else "پوشهٔ مقصد را انتخاب کن.",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def create_server_folder(update, context):
+    message = update.message
+    name = message.text.strip()
+    if not name or len(name) > 48 or not name.isprintable():
+        await message.reply_text("نام پوشه را در یک خط و با حداکثر ۴۸ کاراکتر بفرست.")
+        return
+    try:
+        with ADMIN_DB:
+            ADMIN_DB.execute(
+                "INSERT INTO server_folders (user_id, name) VALUES (?, ?)", (update.effective_user.id, name),
+            )
+    except sqlite3.IntegrityError:
+        await message.reply_text("پوشه‌ای با این نام داری. نام دیگری بفرست.")
+        return
+    context.user_data.pop("folder_pending", None)
+    await message.reply_text(f"پوشهٔ «{name}» ساخته شد.")
+    await show_server_folders(update, context)
+
+
+def move_server_to_folder(db, user_id, server_id, folder_id):
+    with db:
+        server = db.execute("SELECT 1 FROM servers WHERE user_id = ? AND id = ?", (user_id, server_id)).fetchone()
+        if server is None:
+            return False
+        if not folder_id:
+            db.execute("DELETE FROM server_folder_members WHERE server_id = ?", (server_id,))
+            return True
+        folder = db.execute("SELECT 1 FROM server_folders WHERE user_id = ? AND id = ?", (user_id, folder_id)).fetchone()
+        if folder is None:
+            return False
+        db.execute("""
+            INSERT INTO server_folder_members (server_id, folder_id) VALUES (?, ?)
+            ON CONFLICT (server_id) DO UPDATE SET folder_id = excluded.folder_id
+        """, (server_id, folder_id))
+    return True
+
+
 async def show_servers(update, context, page=0):
     message = update.effective_message
     user_id = update.effective_user.id
     state = context.user_data
-    rows = ADMIN_DB.execute(
-        "SELECT id, host, port, username FROM servers WHERE user_id = ? ORDER BY id DESC LIMIT 9 OFFSET ?",
-        (user_id, page * 8),
-    ).fetchall()
+    folder_id = state.get("folder_id")
+    if folder_id is None:
+        rows = ADMIN_DB.execute(
+            "SELECT id, host, port, username FROM servers WHERE user_id = ? ORDER BY id DESC LIMIT 9 OFFSET ?",
+            (user_id, page * 8),
+        ).fetchall()
+    else:
+        rows = ADMIN_DB.execute("""
+            SELECT s.id, s.host, s.port, s.username FROM servers s
+            LEFT JOIN server_folder_members m ON m.server_id = s.id
+            WHERE s.user_id = ? AND COALESCE(m.folder_id, 0) = ?
+            ORDER BY s.id DESC LIMIT 9 OFFSET ?
+        """, (user_id, folder_id, page * 8)).fetchall()
     if not rows and page:
         return await show_servers(update, context, page - 1)
     if not rows and state.get("action"):
         await ask_address(message)
         return
-    token = secrets.token_hex(6)
-    state["servers_token"] = token
+    token = server_list_token(state)
     keyboard = [
         [InlineKeyboardButton(server_label(host, port, username)[:64], callback_data=f"s:{token}:pick:{row_id}")]
         for row_id, host, port, username in rows[:8]
@@ -391,9 +497,17 @@ async def show_servers(update, context, page=0):
         keyboard.append(navigation)
     if state.get("action"):
         keyboard.append([InlineKeyboardButton("➕ سرور جدید", callback_data=f"s:{token}:new:0")])
-    keyboard.append([InlineKeyboardButton("بازگشت", callback_data="cancel")])
+    back = "cancel" if folder_id is None else f"s:{token}:folders_page:0"
+    keyboard.append([InlineKeyboardButton("بازگشت", callback_data=back)])
+    title = "یک سرور انتخاب کن." if rows else "در این پوشه سروری نیست."
+    if folder_id is not None:
+        folder = ADMIN_DB.execute(
+            "SELECT name FROM server_folders WHERE user_id = ? AND id = ?", (user_id, folder_id),
+        ).fetchone()
+        name = folder[0] if folder else "بدون پوشه"
+        title = f"📂 {name}\n{title}"
     await message.reply_text(
-        "یک سرور انتخاب کن." if rows else "هنوز سروری ذخیره نشده است. با اولین ورود موفق، سرور به این فهرست اضافه می‌شود.",
+        title,
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -402,7 +516,7 @@ async def my_servers(update, context):
     await update.callback_query.answer()
     if private_admin(update):
         clear(context)
-        await show_servers(update, context)
+        await show_server_folders(update, context)
 
 
 async def server_button(update, context):
@@ -413,15 +527,45 @@ async def server_button(update, context):
         await query.answer("این منو بسته شده است.")
         return
     await query.answer()
+    user_id = update.effective_user.id
+    number = int(value)
+    if verb == "folders_page":
+        await show_server_folders(update, context, number)
+        return
+    if verb == "folder_new":
+        state.pop("servers_token", None)
+        state["folder_pending"] = True
+        await query.message.reply_text("نام پوشه را بفرست. برای لغو /cancel را بزن.")
+        return
+    if verb == "folder":
+        if number and not ADMIN_DB.execute(
+            "SELECT 1 FROM server_folders WHERE user_id = ? AND id = ?", (user_id, number),
+        ).fetchone():
+            await show_server_folders(update, context)
+            return
+        state["folder_id"] = number
+        await show_servers(update, context)
+        return
+    if verb == "move_page":
+        await show_server_folders(update, context, number, moving=state["moving_server"])
+        return
+    if verb == "move_to":
+        server_id = state.pop("moving_server")
+        if move_server_to_folder(ADMIN_DB, user_id, server_id, number):
+            state["folder_id"] = number
+            await query.message.reply_text("پوشهٔ سرور به‌روزرسانی شد.")
+        else:
+            await query.message.reply_text("سرور یا پوشه پیدا نشد.")
+        await show_servers(update, context)
+        return
     if verb == "page":
-        await show_servers(update, context, int(value))
+        await show_servers(update, context, number)
         return
     if verb == "new":
         state.pop("servers_token")
         await ask_address(query.message)
         return
-    user_id = update.effective_user.id
-    server_id = int(value)
+    server_id = number
     row = ADMIN_DB.execute(
         "SELECT host, port, username, secret FROM servers WHERE user_id = ? AND id = ?", (user_id, server_id),
     ).fetchone()
@@ -436,13 +580,21 @@ async def server_button(update, context):
         await query.message.reply_text("سرور از فهرست ذخیره‌شده حذف شد.")
         await show_servers(update, context)
         return
+    if verb == "move" and not action:
+        await show_server_folders(update, context, moving=server_id)
+        return
     if verb == "pick" and not action:
-        state["servers_token"] = secrets.token_hex(6)
-        token = state["servers_token"]
+        state.pop("moving_server", None)
+        token = server_list_token(state)
+        folder = ADMIN_DB.execute("""
+            SELECT f.name FROM server_folder_members m JOIN server_folders f ON f.id = m.folder_id
+            WHERE m.server_id = ? AND f.user_id = ?
+        """, (server_id, user_id)).fetchone()
         await query.message.reply_text(
-            server_label(host, port, username),
+            f"{server_label(host, port, username)}\nپوشه: {folder[0] if folder else 'بدون پوشه'}",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("اتصال SSH", callback_data=f"s:{token}:connect:{server_id}")],
+                [InlineKeyboardButton("📂 افزودن به پوشه", callback_data=f"s:{token}:move:{server_id}")],
                 [InlineKeyboardButton("حذف سرور", callback_data=f"s:{token}:delete:{server_id}")],
                 [InlineKeyboardButton("بازگشت به فهرست", callback_data=f"s:{token}:page:0")],
             ]),
@@ -2544,6 +2696,9 @@ async def handle_text(update, context):
         return
     state = context.user_data
     message = update.message
+    if state.get("folder_pending"):
+        await create_server_folder(update, context)
+        return
     if private_owner(update) and "vultr" in state:
         await vultr_text(update, context)
         return
@@ -2699,7 +2854,10 @@ if __name__ == "__main__":
         pattern=r"^kms:[a-f0-9]{16}:(?:(?:page|detail):[0-9]+|power:(?:on|off|restart)|(?:confirm|status):0)$",
     ))
     application.add_handler(CallbackQueryHandler(my_servers, pattern=r"^my_servers$"))
-    application.add_handler(CallbackQueryHandler(server_button, pattern=r"^s:[0-9a-f]{12}:(pick|page|new|connect|delete):[0-9]+$"))
+    application.add_handler(CallbackQueryHandler(
+        server_button,
+        pattern=r"^s:[0-9a-f]{12}:(?:pick|page|new|connect|delete|folder_new|folders_page|folder|move|move_page|move_to):[0-9]{1,19}$",
+    ))
     application.add_handler(CallbackQueryHandler(add_admin, pattern=r"^add_admin$"))
     application.add_handler(MessageHandler(filters.StatusUpdate.USERS_SHARED, shared_admin))
     application.add_handler(MessageHandler(filters.Document.ALL, backup_document))
