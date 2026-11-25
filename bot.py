@@ -33,6 +33,7 @@ import dns_rotation
 import hetzner
 import kamatera
 import linode
+import vultr
 
 ROOT = Path(__file__).resolve().parent
 SCRIPT = "https://github.com/PasarGuard/scripts/raw/main/pg-node.sh"
@@ -221,13 +222,16 @@ def init_servers(db):
             db.execute("DELETE FROM hetzner_accounts")
     with db:
         db.execute("CREATE TABLE IF NOT EXISTS cloudflare_accounts (user_id INTEGER PRIMARY KEY, token BLOB NOT NULL)")
+    with db:
+        db.execute("CREATE TABLE IF NOT EXISTS vultr_accounts (user_id INTEGER PRIMARY KEY, token BLOB NOT NULL)")
     dns_rotation.init(db)
     has_saved_secrets = db.execute("""
         SELECT 1 FROM servers WHERE secret IS NOT NULL
         UNION ALL SELECT 1 FROM kamatera_accounts
         UNION ALL SELECT 1 FROM linode_accounts
         UNION ALL SELECT 1 FROM hetzner_projects
-        UNION ALL SELECT 1 FROM cloudflare_accounts LIMIT 1
+        UNION ALL SELECT 1 FROM cloudflare_accounts
+        UNION ALL SELECT 1 FROM vultr_accounts LIMIT 1
     """).fetchone()
     if not key_path.exists() and not has_saved_secrets:
         try:
@@ -300,7 +304,10 @@ def menu(owner):
             InlineKeyboardButton("➕ افزودن ادمین", callback_data="add_admin"),
             InlineKeyboardButton(LABELS["update"], callback_data="update"),
         ])
-        rows.append([InlineKeyboardButton("💾 پشتیبان‌گیری و بازیابی", callback_data="backup")])
+        rows.append([
+            InlineKeyboardButton("☁️ سرور Vultr", callback_data="vultr"),
+            InlineKeyboardButton("💾 پشتیبان‌گیری و بازیابی", callback_data="backup"),
+        ])
     return InlineKeyboardMarkup(rows)
 
 
@@ -2275,7 +2282,7 @@ async def backup_text(update, context):
     await message.reply_text(
         f"بکاپ خوانده شد: {len(rows['servers'])} سرور ذخیره‌شده، "
         f"{len(rows['admins'])} ادمین اضافه‌شده و "
-        f"{sum(len(rows[name]) for name in ('kamatera_accounts', 'linode_accounts', 'hetzner_projects', 'cloudflare_accounts'))} حساب سرویس.\n"
+        f"{sum(len(rows[name]) for name in ('kamatera_accounts', 'linode_accounts', 'hetzner_projects', 'cloudflare_accounts', 'vultr_accounts'))} حساب سرویس.\n"
         "با تأیید، اطلاعات ذخیره‌شدهٔ فعلی ربات با اطلاعات این فایل جایگزین می‌شود.",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("تأیید جایگزینی دیتابیس", callback_data=confirmation)],
@@ -2284,11 +2291,243 @@ async def backup_text(update, context):
     )
 
 
+VULTR_PROMPTS = {
+    "region": "منطقهٔ Vultr را انتخاب کن.",
+    "image": "سیستم‌عامل را انتخاب کن.",
+    "plan": "پلن موجود در منطقه را انتخاب کن.",
+    "servers": "یک سرور Vultr را انتخاب کن.",
+}
+VULTR_OPERATIONS = {**vultr.POWER, "delete": "حذف دائمی"}
+
+
+def vultr_token(user_id):
+    row = ADMIN_DB.execute("SELECT token FROM vultr_accounts WHERE user_id = ?", (user_id,)).fetchone()
+    return SERVER_CIPHER.decrypt(row[0]).decode() if row else None
+
+
+def vultr_keyboard(state, rows):
+    return nonce_keyboard(state, rows, "vp")
+
+
+async def vultr_picker(message, state, page=0):
+    await show_cloud_picker(message, state, page, VULTR_PROMPTS[state["step"]], "vp", "منوی Vultr", "vultr")
+
+
+async def show_vultr_instance(message, state, token):
+    instance = await vultr.details(token, state["instance"])
+    state.update(step="instance", label=str(instance.get("label") or instance["id"])[:120])
+    ips = [value for key in ("main_ip", "v6_main_ip") if (value := instance.get(key)) and value not in {"0.0.0.0", "::"}]
+    await message.reply_text(
+        f"سرور: {state['label']}\nوضعیت ساخت: {instance.get('status') or '—'}\n"
+        f"وضعیت برق: {instance.get('power_status') or '—'}\nمنطقه: {instance.get('region') or '—'}\n"
+        f"پلن: {instance.get('plan') or '—'}\nIP: {', '.join(ips) or '—'}",
+        reply_markup=vultr_keyboard(state, [
+            [(label, operation) for operation, label in vultr.POWER.items()],
+            [("🔑 رمز اولیه", "password"), ("🗑 حذف سرور", "delete")],
+            [("🔄 تازه‌سازی", "refresh"), ("بازگشت به فهرست", "list")],
+        ]),
+    )
+
+
+async def show_vultr_password(message, state, password, title):
+    buttons = list(vultr_keyboard(state, [[("جزئیات سرور", "refresh"), ("سرورهای موجود", "list")]]).inline_keyboard)
+    if isinstance(password, str) and password:
+        title += f"\n\nرمز اولیه:\n{password}"
+        if len(password) <= 256:
+            buttons.insert(0, [InlineKeyboardButton("کپی رمز", copy_text=CopyTextButton(password))])
+    else:
+        title += "\nVultr هنوز رمز اولیه را برنگردانده است. بعد از آماده‌شدن سرور «رمز اولیه» را بررسی کن."
+    await message.reply_text(title, protect_content=bool(password), reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def vultr_button(update, context):
+    query = update.callback_query
+    if not private_owner(update):
+        await query.answer()
+        return
+    action = query.data
+    state = context.user_data.get("vultr", {})
+    if action.startswith("vp:"):
+        _, nonce, action = action.split(":", 2)
+        if nonce != state.get("nonce"):
+            await query.answer("این منو بسته شده است.")
+            return
+    else:
+        clear(context)
+        state = {}
+        context.user_data["vultr"] = state
+    await query.answer()
+    message = query.message
+    if action == "vultr":
+        await message.reply_text("مدیریت Vultr", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔑 ثبت یا تعویض API Key", callback_data="vu:key")],
+            [InlineKeyboardButton("➕ ساخت VPS", callback_data="vu:new"),
+             InlineKeyboardButton("🖥 سرورهای موجود", callback_data="vu:list")],
+            [InlineKeyboardButton("بازگشت", callback_data="cancel")],
+        ]))
+        return
+    if action == "vu:key":
+        state["step"] = "key"
+        await message.reply_text("API Key ولتر را بفرست. ربات تلاش می‌کند پیام حاوی کلید را حذف کند.")
+        return
+    try:
+        token = vultr_token(update.effective_user.id)
+    except InvalidToken:
+        token = None
+    if not token:
+        await message.reply_text("ابتدا API Key ولتر را ثبت کن.")
+        return
+    try:
+        if action == "vu:new":
+            rows = await vultr.catalog("/regions", "regions")
+            state.update(step="region", form={}, choices=[
+                (row["id"], f"{row.get('city') or row['id']} · {row.get('country', row['id'])}") for row in rows
+            ])
+            await vultr_picker(message, state)
+        elif action in {"vu:list", "list"}:
+            rows = await vultr.catalog("/instances", "instances", token)
+            state.update(step="servers", choices=[
+                (row["id"], f"{row.get('label') or row['id']} · {row.get('power_status') or row.get('status', '—')}")
+                for row in rows
+            ])
+            await vultr_picker(message, state)
+        elif action.startswith(("page:", "pick:")):
+            verb, index = action.split(":")
+            index = int(index)
+            if verb == "page":
+                if index * 8 < len(state["choices"]):
+                    await vultr_picker(message, state, index)
+            elif index < len(state["choices"]):
+                await vultr_pick(message, state, token, index)
+        elif action == "refresh":
+            await show_vultr_instance(message, state, token)
+        elif action == "password":
+            instance = await vultr.details(token, state["instance"])
+            await show_vultr_password(message, state, instance.get("default_password"), f"رمز اولیهٔ سرور {state['label']}")
+        elif action in VULTR_OPERATIONS and state["step"] == "instance":
+            state.update(step="operation_confirm", operation=action)
+            text = f"«{VULTR_OPERATIONS[action]}» برای سرور «{state['label']}» با شناسهٔ {state['instance']} انجام شود؟"
+            if action == "delete":
+                text += "\nسرور و داده‌های روی دیسک آن برای همیشه حذف می‌شوند."
+            await message.reply_text(
+                text, reply_markup=vultr_keyboard(state, [[("تأیید", "confirm"), ("انصراف", "refresh")]]),
+            )
+        elif action == "confirm":
+            await vultr_confirm(message, context, state, token)
+    except vultr.APIError as exc:
+        text = "درخواست Vultr ناموفق بود."
+        if action == "confirm" and (exc.status is None or exc.status >= 500):
+            text = "نتیجهٔ درخواست مشخص نیست. پیش از تکرار، وضعیت را در فهرست سرورها بررسی کن."
+        elif exc.status:
+            text += f" HTTP {exc.status}"
+        await message.reply_text(text, reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("منوی Vultr", callback_data="vultr")],
+        ]))
+
+
+async def vultr_pick(message, state, token, index):
+    value, label = state["choices"][index]
+    step = state["step"]
+    if step == "servers":
+        state["instance"] = value
+        await show_vultr_instance(message, state, token)
+        return
+    form = state["form"]
+    if step == "region":
+        plans, images = await vultr.region_options(value)
+        if not plans or not images:
+            await message.reply_text("در این منطقه پلن و ایمیج سازگار پیدا نشد. منطقهٔ دیگری انتخاب کن.")
+            return
+        form["region"] = value
+        state.update(step="image", plans=plans, choices=[(row["id"], row["name"]) for row in images])
+    elif step == "image":
+        form["os_id"] = value
+        state.update(step="plan", image=label, choices=[
+            (plan, f"{plan['id']} · ${vultr.monthly_price(plan, form['region']):g}/mo") for plan in state["plans"]
+        ])
+    else:
+        form["plan"] = value["id"]
+        state.update(step="name", price=vultr.monthly_price(value, form["region"]))
+        state.pop("nonce", None)
+        await message.reply_text("نام VPS را بفرست. برای لغو /cancel را بزن.")
+        return
+    await vultr_picker(message, state)
+
+
+async def vultr_confirm(message, context, state, token):
+    state.pop("nonce", None)
+    if state["step"] == "create_confirm":
+        form = state["form"]
+        clear(context)
+        instance = await vultr.create(token, form)
+        state = {"step": "instance", "instance": instance["id"], "label": form["label"]}
+        context.user_data["vultr"] = state
+        await show_vultr_password(message, state, instance.get("default_password"),
+                                  f"درخواست ساخت VPS ثبت شد. شناسه: {instance['id']}")
+        return
+    operation = state["operation"]
+    await vultr.change_instance(token, state["instance"], operation)
+    if operation == "delete":
+        clear(context)
+        await message.reply_text("درخواست حذف VPS ثبت شد.", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("بازگشت به سرورها", callback_data="vu:list")],
+        ]))
+    else:
+        await message.reply_text("درخواست تغییر وضعیت ثبت شد.", reply_markup=vultr_keyboard(state, [
+            [("🔄 تازه‌سازی", "refresh"), ("بازگشت به فهرست", "list")],
+        ]))
+
+
+async def vultr_text(update, context):
+    message = update.message
+    state = context.user_data["vultr"]
+    value = message.text.strip()
+    step = state.get("step")
+    if step == "key":
+        await delete_secret_message(message)
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,256}", value):
+            await message.reply_text("API Key را در یک خط بفرست.")
+            return
+        try:
+            await vultr.request("GET", "/instances", value, params={"per_page": 1})
+        except vultr.APIError:
+            await message.reply_text("کلید تأیید نشد. کلید و مجاز بودن IP خروجی ربات در Vultr را بررسی کن.")
+            return
+        with ADMIN_DB:
+            ADMIN_DB.execute(
+                "INSERT INTO vultr_accounts VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET token=excluded.token",
+                (update.effective_user.id, SERVER_CIPHER.encrypt(value.encode())),
+            )
+        clear(context)
+        await message.reply_text("کلید Vultr تأیید و رمزگذاری شد.", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("منوی Vultr", callback_data="vultr")],
+        ]))
+    elif step == "name":
+        if len(value) > 63 or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?", value):
+            await message.reply_text("نام را با حروف انگلیسی، عدد و خط تیره بفرست. با خط تیره شروع یا تمام نشود.")
+            return
+        form = state["form"]
+        form.update(label=value, hostname=value)
+        state["step"] = "create_confirm"
+        await message.reply_text(
+            f"نام: {value}\nمنطقه: {form['region']}\nسیستم‌عامل: {state['image']}\n"
+            f"پلن: {form['plan']}\nقیمت اعلام‌شدهٔ پلن: ${state['price']:g} در ماه (USD)\n"
+            f"شبکه: {'فقط IPv6' if form['plan'].endswith('-v6') else 'IPv4 عمومی'}",
+            reply_markup=vultr_keyboard(state, [[("✅ تأیید ساخت و هزینه", "confirm")],
+                                                  [("انصراف", "list")]]),
+        )
+    else:
+        await message.reply_text("از دکمه‌های همین مرحله استفاده کن یا /cancel را بزن.")
+
+
 async def handle_text(update, context):
     if not private_admin(update):
         return
     state = context.user_data
     message = update.message
+    if private_owner(update) and "vultr" in state:
+        await vultr_text(update, context)
+        return
     if private_owner(update) and "backup" in state:
         await backup_text(update, context)
         return
@@ -2413,6 +2652,10 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("update", update_command))
     application.add_handler(CallbackQueryHandler(cancel, pattern=r"^cancel$"))
     application.add_handler(CallbackQueryHandler(select, pattern=r"^(ssh|node|on|off|update)$"))
+    application.add_handler(CallbackQueryHandler(
+        vultr_button,
+        pattern=r"^(?:vultr|vu:(?:key|new|list)|vp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|start|halt|reboot|delete|password|refresh|list|confirm))$",
+    ))
     application.add_handler(CallbackQueryHandler(
         backup_button, pattern=r"^(?:backup|db:(?:export|import|apply:[a-f0-9]{16}))$",
     ))

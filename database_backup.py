@@ -18,6 +18,7 @@ TABLES = {
     "linode_accounts": (("user_id", "i"), ("token", "s")),
     "hetzner_projects": (("id", "i"), ("user_id", "i"), ("name", "t"), ("token", "s")),
     "cloudflare_accounts": (("user_id", "i"), ("token", "s")),
+    "vultr_accounts": (("user_id", "i"), ("token", "s")),
     "dns_rotations": (("id", "i"), ("user_id", "i"), ("zone_id", "t"), ("record_id", "t"),
                       ("name", "t"), ("kind", "t"), ("expected", "t"), ("steps", "t"),
                       ("due_at", "i"), ("attempts", "n"), ("status", "t"), ("note", "t")),
@@ -69,7 +70,8 @@ def restore_file(data, password, storage_cipher):
     try:
         payload = password_cipher(password, data[len(MAGIC):end]).decrypt(data[end:])
         contents = json.loads(payload)
-        if not isinstance(contents, dict) or contents.keys() not in (TABLES.keys(), TABLES.keys() - {"dns_rotations"}):
+        optional = {"dns_rotations", "vultr_accounts"}
+        if not isinstance(contents, dict) or not TABLES.keys() - optional <= contents.keys() <= TABLES.keys():
             raise ValueError
         rows = {table: restore_rows(contents.get(table, []), columns, storage_cipher) for table, columns in TABLES.items()}
         for fields in rows["dns_rotations"]:
