@@ -2,6 +2,8 @@ import base64
 import json
 import os
 
+import dns_rotation
+
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
@@ -16,6 +18,9 @@ TABLES = {
     "linode_accounts": (("user_id", "i"), ("token", "s")),
     "hetzner_projects": (("id", "i"), ("user_id", "i"), ("name", "t"), ("token", "s")),
     "cloudflare_accounts": (("user_id", "i"), ("token", "s")),
+    "dns_rotations": (("id", "i"), ("user_id", "i"), ("zone_id", "t"), ("record_id", "t"),
+                      ("name", "t"), ("kind", "t"), ("expected", "t"), ("steps", "t"),
+                      ("due_at", "i"), ("attempts", "n"), ("status", "t"), ("note", "t")),
 }
 
 
@@ -64,9 +69,15 @@ def restore_file(data, password, storage_cipher):
     try:
         payload = password_cipher(password, data[len(MAGIC):end]).decrypt(data[end:])
         contents = json.loads(payload)
-        if not isinstance(contents, dict) or contents.keys() != TABLES.keys():
+        if not isinstance(contents, dict) or contents.keys() not in (TABLES.keys(), TABLES.keys() - {"dns_rotations"}):
             raise ValueError
-        return {table: restore_rows(contents[table], columns, storage_cipher) for table, columns in TABLES.items()}
+        rows = {table: restore_rows(contents.get(table, []), columns, storage_cipher) for table, columns in TABLES.items()}
+        for fields in rows["dns_rotations"]:
+            rotation = dns_rotation.Rotation(*fields)
+            if rotation.status not in {"active", "done", "failed", "cancelled"} or rotation.due_at > 253402200000:
+                raise ValueError
+            dns_rotation.read_steps(rotation)
+        return rows
     except (InvalidToken, ValueError, RecursionError):
         raise BackupError("Invalid backup or password") from None
 
@@ -83,6 +94,8 @@ def restore_rows(entries, columns, cipher):
             if value is None and kind.endswith("?"):
                 normalized.append(None)
             elif kind == "i" and type(value) is int and 0 < value < 2**63 and (name != "port" or value <= 65535):
+                normalized.append(value)
+            elif kind == "n" and type(value) is int and 0 <= value < 2**63:
                 normalized.append(value)
             elif kind.startswith("t") and isinstance(value, str):
                 normalized.append(value)

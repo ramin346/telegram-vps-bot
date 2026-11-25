@@ -1,4 +1,6 @@
 import asyncio
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from html import escape
 from ipaddress import IPv6Address
 import logging
@@ -12,6 +14,7 @@ import subprocess
 import tempfile
 import time
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import paramiko
 from cryptography.fernet import Fernet, InvalidToken
@@ -26,6 +29,7 @@ from telegram.ext import (
 
 import cloudflare
 import database_backup
+import dns_rotation
 import hetzner
 import kamatera
 import linode
@@ -217,6 +221,7 @@ def init_servers(db):
             db.execute("DELETE FROM hetzner_accounts")
     with db:
         db.execute("CREATE TABLE IF NOT EXISTS cloudflare_accounts (user_id INTEGER PRIMARY KEY, token BLOB NOT NULL)")
+    dns_rotation.init(db)
     has_saved_secrets = db.execute("""
         SELECT 1 FROM servers WHERE secret IS NOT NULL
         UNION ALL SELECT 1 FROM kamatera_accounts
@@ -1660,6 +1665,161 @@ async def hetzner_text(update, context):
         await message.reply_text("از دکمه‌های همین مرحله استفاده کن یا /cancel را بزن.")
 
 
+ROTATION_LOCK = asyncio.Lock()
+ROTATION_STATUS = {"active": "فعال", "done": "تمام‌شده", "failed": "متوقف با خطا", "cancelled": "لغوشده"}
+
+
+async def dns_rotation_job(context):
+    for user_id, rotation_id in dns_rotation.due(ADMIN_DB):
+        async with ROTATION_LOCK:
+            row = dns_rotation.get(ADMIN_DB, user_id, rotation_id)
+            if not row or row.status != "active" or row.due_at > int(time.time()):
+                continue
+            try:
+                token = cf_token(user_id) if user_id in OWNER_IDS else None
+            except InvalidToken:
+                token = None
+            await dns_rotation.apply_step(ADMIN_DB, row, token)
+
+
+async def cf_rotation_list(message, state, user_id, page=0):
+    if page == 0:
+        entries = dns_rotation.for_zone(ADMIN_DB, user_id, state["zone"]["id"])
+        state.update(step="rotation_list", choices=[
+            (rotation_id, f"{name} · {ROTATION_STATUS.get(status, status)}") for rotation_id, name, status in entries
+        ])
+    await show_cloud_picker(
+        message, state, page, f"برنامه‌های تعویض IP · {state['zone']['name']}", "cp",
+        "منوی Cloudflare", "cloudflare",
+    )
+
+
+async def cf_rotation_details(message, state, user_id, rotation_id):
+    row = dns_rotation.get(ADMIN_DB, user_id, rotation_id)
+    if not row or row.zone_id != state["zone"]["id"]:
+        await cf_rotation_list(message, state, user_id)
+        return
+    state.update(step="rotation_details", rotation_id=row.id)
+    steps = dns_rotation.read_steps(row)
+    text = f"{row.name} · {row.kind}\nوضعیت: {ROTATION_STATUS.get(row.status, row.status)}\nمرحله‌های باقی‌مانده: {len(steps)}"
+    rows = [[("🔄 تازه‌سازی", "rot_refresh"), ("↩️ فهرست برنامه‌ها", "rot_list")]]
+    if row.status == "active":
+        date = datetime.fromtimestamp(row.due_at, ZoneInfo("Asia/Tehran")).strftime("%Y-%m-%d %H:%M:%S")
+        text += f"\nIP مرحلهٔ بعد: {steps[0][1]}\nزمان اجرای بعدی: {date} به وقت تهران"
+        rows.insert(0, [("🛑 لغو برنامه", "rot_cancel")])
+    if row.note:
+        text += "\n" + row.note
+    await message.reply_text(text, reply_markup=cf_keyboard(state, rows))
+
+
+async def cf_rotation_next(message, state):
+    state["step"] = "rotation_delay"
+    state.pop("nonce", None)
+    prompt = (
+        "چند ساعت بعد از فعال‌شدن برنامه، IP عوض شود؟"
+        if not state["rotation_steps"] else "چند ساعت بعد از اعمال موفق مرحلهٔ قبلی، IP بعدی تنظیم شود؟"
+    )
+    await message.reply_text(prompt + " مثلاً ۳ یا ۱.۵. برای لغو /cancel را بزن.")
+
+
+async def cf_rotation_text(message, state, value):
+    if state["step"] == "rotation_delay":
+        try:
+            value = value.replace("٫", ".")
+            if not re.fullmatch(r"\d{1,7}(?:\.\d{1,4})?", value):
+                raise ValueError
+            seconds = int(Decimal(value) * 3600)
+            if not 1 <= seconds <= dns_rotation.MAX_DELAY:
+                raise ValueError
+        except (ValueError, InvalidOperation):
+            await message.reply_text("تعداد ساعت را با عددی مثبت و حداکثر ۸۷۶۰۰ وارد کن.")
+            return
+        state.update(step="rotation_ip", rotation_delay=seconds)
+        await message.reply_text(f"IP بعدی رکورد {state['record']['type']} را بفرست.")
+        return
+    try:
+        target = cloudflare.destination(value, state["record"]["type"])
+    except ValueError:
+        await message.reply_text("IP با نوع رکورد سازگار نیست. دوباره بفرست.")
+        return
+    steps = state["rotation_steps"]
+    previous = steps[-1][1] if steps else cloudflare.destination(state["record"]["content"], state["record"]["type"])
+    if target == previous:
+        await message.reply_text("این IP با مرحلهٔ قبلی یکی است. IP دیگری بفرست.")
+        return
+    steps.append((state.pop("rotation_delay"), target))
+    state["step"] = "rotation_add"
+    await message.reply_text(
+        f"مرحلهٔ {len(steps)} اضافه شد. IP بعدی هم اضافه شود؟",
+        reply_markup=cf_keyboard(state, [[("➕ IP بعدی", "rot_next"), ("🏁 اتمام", "rot_review")]]),
+    )
+
+
+async def cf_rotation_review(message, state, page=0):
+    state["step"] = "rotation_review"
+    steps = state["rotation_steps"]
+    start = page * 10
+    lines = [
+        f"{index}. {seconds / 3600:.6g} ساعت بعد ← {target}"
+        for index, (seconds, target) in enumerate(steps[start:start + 10], start + 1)
+    ]
+    nav = []
+    if page:
+        nav.append(("◀ قبلی", f"rot_page:{page - 1}"))
+    if start + 10 < len(steps):
+        nav.append(("بعدی ▶", f"rot_page:{page + 1}"))
+    rows = [nav] if nav else []
+    rows.extend([[("✅ تأیید و فعال‌سازی", "rot_confirm")], [("➕ IP بعدی", "rot_next"), ("انصراف", "dns")]])
+    await message.reply_text(
+        f"تعویض IP برای {state['record']['name']} · {len(steps)} مرحله\n"
+        + "\n".join(lines) + "\nزمان هر مرحله از اجرای موفق مرحلهٔ قبل حساب می‌شود.",
+        reply_markup=cf_keyboard(state, rows),
+    )
+
+
+async def cf_rotation_button(message, state, token, user_id, action):
+    if action == "rot_list":
+        await cf_rotation_list(message, state, user_id)
+    elif action == "rot_refresh":
+        await cf_rotation_details(message, state, user_id, state["rotation_id"])
+    elif action == "rot_cancel":
+        async with ROTATION_LOCK:
+            row = dns_rotation.get(ADMIN_DB, user_id, state["rotation_id"])
+            if row and row.zone_id == state["zone"]["id"]:
+                dns_rotation.stop(ADMIN_DB, row, "cancelled")
+        await cf_rotation_details(message, state, user_id, state["rotation_id"])
+    elif action == "rotate":
+        record = state["record"]
+        if record["type"] in {"A", "AAAA"}:
+            state["rotation_steps"] = []
+            await cf_rotation_next(message, state)
+    elif action == "rot_next":
+        await cf_rotation_next(message, state)
+    elif action == "rot_review":
+        await cf_rotation_review(message, state)
+    elif action.startswith("rot_page:"):
+        page = int(action.split(":")[1])
+        if page * 10 < len(state["rotation_steps"]):
+            await cf_rotation_review(message, state, page)
+    elif action == "rot_confirm":
+        state.pop("nonce", None)
+        original = state["record"]
+        try:
+            async with ROTATION_LOCK:
+                latest = await cloudflare.record(token, state["zone"]["id"], original["id"])
+                if any(latest.get(key) != original.get(key) for key in ("name", "type", "content")):
+                    await message.reply_text("رکورد تغییر کرده است. دوباره انتخابش کن.")
+                    await cf_dns_menu(message, state)
+                    return
+                latest["content"] = cloudflare.destination(latest["content"], latest["type"])
+                rotation_id = dns_rotation.schedule(ADMIN_DB, user_id, state["zone"]["id"], latest, state["rotation_steps"])
+        except sqlite3.IntegrityError:
+            await message.reply_text("برای این رکورد از قبل برنامهٔ فعال وجود دارد.")
+            await cf_rotation_list(message, state, user_id)
+            return
+        await cf_rotation_details(message, state, user_id, rotation_id)
+
+
 CF_FIELDS = {"name": "نام ساب‌دامنه", "content": "مقصد", "proxied": "Proxy", "ttl": "TTL"}
 
 
@@ -1684,7 +1844,7 @@ async def cf_dns_menu(message, state):
         reply_markup=cf_keyboard(state, [
             [("➕ افزودن ساب‌دامنه", "add"), ("✏️ تغییر ساب‌دامنه", "edit_list")],
             [("🔍 جست‌وجوی ساب‌دامنه", "search"), ("📋 نمایش ساب‌دامنه‌ها", "list")],
-            [("تغییر دامنه", "zones")],
+            [("🕒 برنامه‌های تعویض IP", "rot_list"), ("تغییر دامنه", "zones")],
         ]),
     )
 
@@ -1717,6 +1877,8 @@ async def cf_record_menu(message, state, token, record_id):
             settings.append(("تغییر TTL", "field:ttl"))
         if settings:
             rows.append(settings)
+    if row["type"] in {"A", "AAAA"}:
+        rows.append([("🔁 تعویض خودکار IP", "rotate")])
     rows.extend([[("🗑 حذف رکورد", "delete")], [("بازگشت به DNS", "dns")]])
     await message.reply_text(
         f"{row['name']} · {row['type']}\nمقصد: {str(row.get('content') or '—')[:1000]}\n"
@@ -1844,12 +2006,17 @@ async def cloudflare_button(update, context):
             index = int(raw)
             if verb == "page":
                 if index * 8 < len(state["choices"]):
-                    await cf_picker(message, state, index)
+                    if state["step"] == "rotation_list":
+                        await cf_rotation_list(message, state, update.effective_user.id, index)
+                    else:
+                        await cf_picker(message, state, index)
             elif index < len(state["choices"]):
                 value = state["choices"][index][0]
                 if state["step"] == "zones":
                     state["zone"] = value
                     await cf_dns_menu(message, state)
+                elif state["step"] == "rotation_list":
+                    await cf_rotation_details(message, state, update.effective_user.id, value)
                 else:
                     await cf_record_menu(message, state, token, value)
         elif action in {"list", "edit_list"}:
@@ -1888,9 +2055,12 @@ async def cloudflare_button(update, context):
             state.update(mode="delete", changes={})
             await cf_review(message, state)
         elif action == "confirm":
-            await cf_commit(message, state, token)
+            async with ROTATION_LOCK:
+                await cf_commit(message, state, token)
+        elif action == "rotate" or action.startswith("rot_"):
+            await cf_rotation_button(message, state, token, update.effective_user.id, action)
     except cloudflare.APIError as exc:
-        await cf_error(message, state, exc, action == "confirm")
+        await cf_error(message, state, exc, action in {"confirm", "rot_confirm"})
 
 
 async def cf_error(message, state, exc, writing=False):
@@ -1928,6 +2098,9 @@ async def cloudflare_text(update, context):
         await message.reply_text("توکن رمزگذاری و ذخیره شد.", reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("مدیریت DNS", callback_data="cf:zones")],
         ]))
+        return
+    if step in {"rotation_delay", "rotation_ip"}:
+        await cf_rotation_text(message, state, value)
         return
     if step == "search":
         if not value or len(value) > 253 or not value.isprintable():
@@ -1982,7 +2155,8 @@ async def backup_button(update, context):
         rows = state["rows"]
         clear(context)
         try:
-            database_backup.replace_data(ADMIN_DB, rows)
+            async with ROTATION_LOCK:
+                database_backup.replace_data(ADMIN_DB, rows)
         except sqlite3.Error:
             await message.reply_text("بازیابی ناموفق بود. اطلاعات قبلی در پایگاه داده حفظ شد.")
             return
@@ -2225,7 +2399,7 @@ if __name__ == "__main__":
     ))
     application.add_handler(CallbackQueryHandler(
         cloudflare_button,
-        pattern=r"^(?:cloudflare|cf:(?:key|zones)|cp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|zones|list|edit_list|search|dns|add|type:(?:A|AAAA|CNAME)|field:(?:name|content|proxied|ttl)|proxy:(?:on|off)|ttl:(?:1|60|300|600|1800|3600)|delete|confirm))$",
+        pattern=r"^(?:cloudflare|cf:(?:key|zones)|cp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|zones|list|edit_list|search|dns|add|type:(?:A|AAAA|CNAME)|field:(?:name|content|proxied|ttl)|proxy:(?:on|off)|ttl:(?:1|60|300|600|1800|3600)|delete|confirm|rotate|rot_(?:next|review|confirm|list|refresh|cancel|page:[0-9]{1,8})))$",
     ))
     application.add_handler(CallbackQueryHandler(
         hetzner_button,
@@ -2250,4 +2424,5 @@ if __name__ == "__main__":
     application.add_handler(MessageHandler(filters.Document.ALL, backup_document))
     application.add_handler(MessageHandler(filters.TEXT, handle_text))
     application.add_error_handler(report_error)
+    application.job_queue.run_repeating(dns_rotation_job, interval=15, first=1)
     application.run_polling(drop_pending_updates=True, allowed_updates=["message", "callback_query"])
