@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 import tempfile
 import time
+from urllib.parse import quote
 
 import paramiko
 from cryptography.fernet import Fernet, InvalidToken
@@ -22,6 +23,8 @@ from telegram.error import TelegramError
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters,
 )
+
+import kamatera
 
 ROOT = Path(__file__).resolve().parent
 SCRIPT = "https://github.com/PasarGuard/scripts/raw/main/pg-node.sh"
@@ -182,7 +185,16 @@ def init_servers(db):
                 UNIQUE (user_id, host, port, username)
             )
         """)
-    if not key_path.exists() and not db.execute("SELECT 1 FROM servers WHERE secret IS NOT NULL LIMIT 1").fetchone():
+    with db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS kamatera_accounts (
+                user_id INTEGER PRIMARY KEY, credentials BLOB NOT NULL, command_id TEXT
+            )
+        """)
+    has_saved_secrets = db.execute(
+        "SELECT 1 FROM servers WHERE secret IS NOT NULL UNION ALL SELECT 1 FROM kamatera_accounts LIMIT 1"
+    ).fetchone()
+    if not key_path.exists() and not has_saved_secrets:
         try:
             def private_file(name, flags):
                 return os.open(name, flags, 0o600)
@@ -237,6 +249,7 @@ def menu(owner):
     rows.append([InlineKeyboardButton(LABELS[name], callback_data=name) for name in ("on", "off")])
     rows.append([InlineKeyboardButton("🖥 سرورهای من", callback_data="my_servers")])
     if owner:
+        rows.append([InlineKeyboardButton("☁️ سرور کاماترا", callback_data="kamatera")])
         rows.append([
             InlineKeyboardButton("➕ افزودن ادمین", callback_data="add_admin"),
             InlineKeyboardButton(LABELS["update"], callback_data="update"),
@@ -513,11 +526,242 @@ async def operate(message, state, client, command=None):
         await send_code(message, output.strip()[-6000:])
 
 
+def kamatera_account(user_id):
+    return ADMIN_DB.execute(
+        "SELECT credentials, command_id FROM kamatera_accounts WHERE user_id = ?", (user_id,),
+    ).fetchone()
+
+
+async def kamatera_token(user_id):
+    account = kamatera_account(user_id)
+    if not account:
+        raise kamatera.APIError()
+    client_id, secret = SERVER_CIPHER.decrypt(account[0]).decode().split("\n", 1)
+    return await kamatera.authenticate(client_id, secret)
+
+
+async def kamatera_button(update, context):
+    query = update.callback_query
+    await query.answer()
+    if not private_owner(update):
+        return
+    message = query.message
+    user_id = update.effective_user.id
+    state = context.user_data
+    action = query.data
+    if action.startswith("km:make:"):
+        draft = state.get("kamatera", {})
+        if draft.get("confirmation") != action:
+            await message.reply_text("این تأیید قدیمی است. از منوی کاماترا دوباره شروع کن.")
+            return
+        form = draft["form"]
+        clear(context)
+        try:
+            token = await kamatera_token(user_id)
+        except (kamatera.APIError, InvalidToken):
+            await message.reply_text("ورود به API ناموفق بود. کلید کاماترا را بررسی کن.")
+            return
+        try:
+            command_id = await kamatera.create_server(token, form)
+        except kamatera.APIError as exc:
+            if exc.status and 400 <= exc.status < 500:
+                await message.reply_text(f"کاماترا درخواست ساخت را با خطای HTTP {exc.status} رد کرد.")
+            else:
+                await message.reply_text("نتیجهٔ ساخت مشخص نیست. قبل از ارسال دوباره، صف عملیات را در پنل کاماترا بررسی کن.")
+            return
+        try:
+            with ADMIN_DB:
+                ADMIN_DB.execute(
+                    "UPDATE kamatera_accounts SET command_id = ? WHERE user_id = ?", (command_id, user_id),
+                )
+        except sqlite3.Error:
+            await message.reply_text(f"درخواست ساخت ثبت شد، اما ذخیرهٔ شناسه در ربات ناموفق بود. شناسه: {command_id}")
+            return
+        await message.reply_text(
+            f"درخواست ساخت ثبت شد. شناسهٔ عملیات: {command_id}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بررسی وضعیت", callback_data="km:status")]]),
+        )
+        return
+
+    clear(context)
+    if action == "kamatera":
+        await message.reply_text("مدیریت کاماترا", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("ثبت یا تعویض کلید API", callback_data="km:key")],
+            [InlineKeyboardButton("ساخت VPS", callback_data="km:new")],
+            [InlineKeyboardButton("وضعیت آخرین درخواست", callback_data="km:status")],
+            [InlineKeyboardButton("بازگشت", callback_data="cancel")],
+        ]))
+        return
+    if action == "km:key":
+        state["kamatera"] = {"step": "key"}
+        await message.reply_text(
+            "Client ID و API Secret را در دو خطِ یک پیام بفرست. ربات تلاش می‌کند پیام را حذف کند. "
+            "چت ربات رمزنگاری سرتاسری ندارد."
+        )
+        return
+    account = kamatera_account(user_id)
+    if not account:
+        await message.reply_text("اول کلید API کاماترا را در منوی کاماترا ثبت کن.")
+        return
+    try:
+        token = await kamatera_token(user_id)
+        if action == "km:status":
+            if not account[1]:
+                await message.reply_text("هنوز درخواست ساختی ثبت نشده است.")
+                return
+            result = await kamatera.command_status(token, account[1])
+            status = {"complete": "ساخت کامل شد", "error": "ساخت ناموفق بود"}.get(
+                result["status"], "در صف یا در حال انجام",
+            )
+            name = str(result.get("server") or "")[:120]
+            await message.reply_text(f"عملیات {account[1]} — {status}" + (f"\nسرور: {name}" if name else ""))
+            return
+        data = await kamatera.options(token, "datacenters")
+        if not isinstance(data, dict):
+            raise kamatera.APIError()
+    except (kamatera.APIError, InvalidToken):
+        await message.reply_text("دریافت اطلاعات از کاماترا ناموفق بود. کلید API را بررسی کن.")
+        return
+    locations = {
+        code: f"{details.get('city', '')} {details.get('country', '')}".strip()
+        for code, details in data.items() if isinstance(details, dict)
+    }
+    if not locations:
+        await message.reply_text("کاماترا دیتاسنتری برای این حساب برنگرداند.")
+        return
+    state["kamatera"] = {"step": "location", "locations": locations, "form": {}}
+    await message.reply_text("کد دیتاسنتر را از فهرست زیر بفرست.")
+    await send_code(message, "\n".join(f"{code}  {label}" for code, label in locations.items()))
+
+
+async def delete_secret_message(message):
+    try:
+        await message.delete()
+    except TelegramError:
+        await message.reply_text("حذف پیام ممکن نشد. پیام حاوی اطلاعات محرمانه را دستی پاک کن.")
+
+
+async def kamatera_text(update, context):
+    message = update.message
+    draft = context.user_data["kamatera"]
+    step = draft["step"]
+    value = message.text.strip()
+    user_id = update.effective_user.id
+    if step == "key":
+        await delete_secret_message(message)
+        fields = value.splitlines()
+        if len(fields) != 2 or not all(field.strip() for field in fields):
+            await message.reply_text("Client ID و API Secret را هرکدام در یک خط بفرست.")
+            return
+        try:
+            await kamatera.authenticate(*(field.strip() for field in fields))
+        except kamatera.APIError:
+            await message.reply_text("احراز هویت کاماترا ناموفق بود. کلید را بررسی کن و دوباره بفرست.")
+            return
+        with ADMIN_DB:
+            ADMIN_DB.execute(
+                """INSERT INTO kamatera_accounts VALUES (?, ?, NULL)
+                   ON CONFLICT(user_id) DO UPDATE SET credentials=excluded.credentials, command_id=NULL""",
+                (user_id, SERVER_CIPHER.encrypt("\n".join(field.strip() for field in fields).encode())),
+            )
+        clear(context)
+        await message.reply_text("کلید API کاماترا تأیید و رمزگذاری شد.")
+        return
+
+    form = draft["form"]
+    if step in {"location", "image"}:
+        try:
+            token = await kamatera_token(user_id)
+            if step == "location":
+                location = next((code for code in draft["locations"] if code.casefold() == value.casefold()), None)
+                if location is None:
+                    await message.reply_text("کد یکی از دیتاسنترهای فهرست را بفرست.")
+                    return
+                data = await kamatera.options(token, "images/" + quote(location, safe=""))
+                if not isinstance(data, list):
+                    raise kamatera.APIError()
+                images = {item["id"]: item for item in data if isinstance(item, dict) and isinstance(item.get("id"), str)}
+                if not images:
+                    await message.reply_text("برای این دیتاسنتر ایمیجی پیدا نشد. کد دیتاسنتر دیگری را بفرست.")
+                    return
+                form["datacenter"] = location
+                draft.update(step="image", images=images)
+                await message.reply_text("شناسهٔ ایمیج سیستم‌عامل را بفرست. برای دیدن فهرست محدودتر، نام سیستم‌عامل مثل Ubuntu را بنویس.")
+                await send_code(message, "\n".join(f"{i}  {item.get('description', '')}" for i, item in list(images.items())[:20]))
+                return
+            if value not in draft["images"]:
+                matches = [
+                    f"{key}  {image.get('description', '')}"
+                    for key, image in draft["images"].items()
+                    if value and value.casefold() in str(image.get("description", "")).casefold()
+                ]
+                if matches:
+                    await send_code(message, "\n".join(matches[:20]))
+                else:
+                    await message.reply_text("ایمیج پیدا نشد. شناسه یا بخشی از نام سیستم‌عامل را بفرست.")
+                return
+            data = await kamatera.options(token, "image/" + quote(value, safe=""))
+            if not isinstance(data, dict) or not {"cpu", "ram", "disk", "billing"} <= data.keys():
+                raise kamatera.APIError()
+        except (kamatera.APIError, InvalidToken):
+            await message.reply_text("دریافت گزینه‌ها ناموفق بود. دوباره تلاش کن.")
+            return
+        if "hourly" not in data["billing"]:
+            await message.reply_text("این ایمیج ساخت ساعتی ندارد. ایمیج دیگری انتخاب کن.")
+            return
+        image = draft["images"][value]
+        form["disk_src_0"] = value
+        draft.update(step="size", options=data, image=image.get("description", value), min_disk=image.get("sizeGB") or 0)
+        await message.reply_text("CPU، رم به مگابایت و دیسک به گیگابایت را با فاصله بفرست. در گزینه‌ها نوع رم باید با حرف آخر CPU یکی باشد.")
+        await send_code(message, f"CPU: {data['cpu']}\nRAM: {data['ram']}\nDisk: {data['disk']}\nMinimum image disk: {draft['min_disk']} GB")
+        return
+    if step == "size":
+        match = re.fullmatch(r"([1-9][0-9]{0,3}[A-Z])\s+([0-9]{1,7})\s+([0-9]{1,5})", value.upper())
+        if match:
+            cpu, ram, disk = match.groups()
+            opts = draft["options"]
+            if cpu in opts["cpu"] and int(ram) in opts["ram"].get(cpu[-1], []) and int(disk) in opts["disk"] and int(disk) >= int(draft["min_disk"]):
+                form.update(cpu=cpu, ram=int(ram), disk_size_0=int(disk))
+                draft["step"] = "name"
+                await message.reply_text("نام VPS را بفرست.")
+                return
+        await message.reply_text("ترکیب CPU، رم و دیسک را مطابق فهرست بفرست. نمونه: 2B 2048 30")
+        return
+    if step == "name":
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}", value):
+            await message.reply_text("نام سرور را با حروف انگلیسی، عدد، خط تیره یا زیرخط بفرست.")
+            return
+        form["name"] = value
+        draft["step"] = "password"
+        await message.reply_text("رمز اولیهٔ VPS را بفرست. ۹ تا ۳۲ کاراکتر با حرف کوچک، حرف بزرگ و عدد. ربات تلاش می‌کند پیام رمز را حذف کند.")
+        return
+    if step == "password":
+        await delete_secret_message(message)
+        if not (9 <= len(value) <= 32 and re.search(r"[a-z]", value) and re.search(r"[A-Z]", value) and re.search(r"[0-9]", value)):
+            await message.reply_text("رمز باید ۹ تا ۳۲ کاراکتر و شامل حرف کوچک، حرف بزرگ و عدد باشد.")
+            return
+        form["password"] = value
+        confirmation = "km:make:" + secrets.token_hex(8)
+        draft.update(step="confirm", confirmation=confirmation)
+        await message.reply_text(
+            f"سرور: {form['name']}\nدیتاسنتر: {form['datacenter']}\nایمیج: {draft['image']}\n"
+            f"CPU: {form['cpu']} | RAM: {form['ram']} MB | Disk: {form['disk_size_0']} GB\n"
+            "یک VPS با IP عمومی و تعرفهٔ ساعتی ساخته می‌شود. هزینه طبق تعرفهٔ حسابت در کاماترا محاسبه می‌شود.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("تأیید ساخت و هزینه", callback_data=confirmation)],
+                [InlineKeyboardButton("لغو", callback_data="cancel")],
+            ]),
+        )
+
+
 async def handle_text(update, context):
     if not private_admin(update):
         return
     state = context.user_data
     message = update.message
+    if private_owner(update) and "kamatera" in state:
+        await kamatera_text(update, context)
+        return
     if private_owner(update) and "admin_request" in state:
         value = message.text.strip()
         if re.fullmatch(r"[0-9]{1,16}", value) and 0 < int(value) < 2**52:
@@ -627,6 +871,7 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("update", update_command))
     application.add_handler(CallbackQueryHandler(cancel, pattern=r"^cancel$"))
     application.add_handler(CallbackQueryHandler(select, pattern=r"^(ssh|node|on|off|update)$"))
+    application.add_handler(CallbackQueryHandler(kamatera_button, pattern=r"^(kamatera|km:(key|new|status|make:[a-f0-9]{16}))$"))
     application.add_handler(CallbackQueryHandler(my_servers, pattern=r"^my_servers$"))
     application.add_handler(CallbackQueryHandler(server_button, pattern=r"^s:[0-9a-f]{12}:(pick|page|new|connect|delete):[0-9]+$"))
     application.add_handler(CallbackQueryHandler(add_admin, pattern=r"^add_admin$"))
