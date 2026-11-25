@@ -1699,14 +1699,14 @@ async def cf_rotation_details(message, state, user_id, rotation_id):
     if not row or row.zone_id != state["zone"]["id"]:
         await cf_rotation_list(message, state, user_id)
         return
-    state.update(step="rotation_details", rotation_id=row.id)
+    state.update(step="rotation_details", rotation_id=row.id, rotation_steps_shown=row.steps)
     steps = dns_rotation.read_steps(row)
     text = f"{row.name} · {row.kind}\nوضعیت: {ROTATION_STATUS.get(row.status, row.status)}\nمرحله‌های باقی‌مانده: {len(steps)}"
     rows = [[("🔄 تازه‌سازی", "rot_refresh"), ("↩️ فهرست برنامه‌ها", "rot_list")]]
     if row.status == "active":
         date = datetime.fromtimestamp(row.due_at, ZoneInfo("Asia/Tehran")).strftime("%Y-%m-%d %H:%M:%S")
         text += f"\nIP مرحلهٔ بعد: {steps[0][1]}\nزمان اجرای بعدی: {date} به وقت تهران"
-        rows.insert(0, [("🛑 لغو برنامه", "rot_cancel")])
+        rows.insert(0, [("⚡ الان عوض کن", "rot_now"), ("🛑 لغو برنامه", "rot_cancel")])
     if row.note:
         text += "\n" + row.note
     await message.reply_text(text, reply_markup=cf_keyboard(state, rows))
@@ -1782,6 +1782,25 @@ async def cf_rotation_button(message, state, token, user_id, action):
         await cf_rotation_list(message, state, user_id)
     elif action == "rot_refresh":
         await cf_rotation_details(message, state, user_id, state["rotation_id"])
+    elif action == "rot_now":
+        state.pop("nonce", None)
+        rotation_id = state["rotation_id"]
+        async with ROTATION_LOCK:
+            row = dns_rotation.get(ADMIN_DB, user_id, rotation_id)
+            same_step = (
+                row and row.zone_id == state["zone"]["id"] and row.status == "active"
+                and row.steps == state["rotation_steps_shown"]
+            )
+            if same_step:
+                await dns_rotation.apply_step(ADMIN_DB, row, token)
+                updated = dns_rotation.get(ADMIN_DB, user_id, rotation_id)
+        if not same_step:
+            await message.reply_text("این مرحله دیگر در صف نیست. وضعیت برنامه تازه شد.")
+        elif updated.steps != row.steps:
+            await message.reply_text(f"IP رکورد در Cloudflare به {updated.expected} تغییر کرد.")
+        elif updated.status == "active":
+            await message.reply_text("تغییر فوری تأیید نشد. ربات در زمان نمایش‌داده‌شده دوباره تلاش می‌کند.")
+        await cf_rotation_details(message, state, user_id, rotation_id)
     elif action == "rot_cancel":
         async with ROTATION_LOCK:
             row = dns_rotation.get(ADMIN_DB, user_id, state["rotation_id"])
@@ -2399,7 +2418,7 @@ if __name__ == "__main__":
     ))
     application.add_handler(CallbackQueryHandler(
         cloudflare_button,
-        pattern=r"^(?:cloudflare|cf:(?:key|zones)|cp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|zones|list|edit_list|search|dns|add|type:(?:A|AAAA|CNAME)|field:(?:name|content|proxied|ttl)|proxy:(?:on|off)|ttl:(?:1|60|300|600|1800|3600)|delete|confirm|rotate|rot_(?:next|review|confirm|list|refresh|cancel|page:[0-9]{1,8})))$",
+        pattern=r"^(?:cloudflare|cf:(?:key|zones)|cp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|zones|list|edit_list|search|dns|add|type:(?:A|AAAA|CNAME)|field:(?:name|content|proxied|ttl)|proxy:(?:on|off)|ttl:(?:1|60|300|600|1800|3600)|delete|confirm|rotate|rot_(?:next|review|confirm|list|refresh|now|cancel|page:[0-9]{1,8})))$",
     ))
     application.add_handler(CallbackQueryHandler(
         hetzner_button,
