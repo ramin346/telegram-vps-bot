@@ -24,6 +24,7 @@ from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters,
 )
 
+import cloudflare
 import hetzner
 import kamatera
 import linode
@@ -213,11 +214,14 @@ def init_servers(db):
                 WHERE user_id NOT IN (SELECT user_id FROM hetzner_projects WHERE name = 'پیش‌فرض')
             """)
             db.execute("DELETE FROM hetzner_accounts")
+    with db:
+        db.execute("CREATE TABLE IF NOT EXISTS cloudflare_accounts (user_id INTEGER PRIMARY KEY, token BLOB NOT NULL)")
     has_saved_secrets = db.execute("""
         SELECT 1 FROM servers WHERE secret IS NOT NULL
         UNION ALL SELECT 1 FROM kamatera_accounts
         UNION ALL SELECT 1 FROM linode_accounts
-        UNION ALL SELECT 1 FROM hetzner_projects LIMIT 1
+        UNION ALL SELECT 1 FROM hetzner_projects
+        UNION ALL SELECT 1 FROM cloudflare_accounts LIMIT 1
     """).fetchone()
     if not key_path.exists() and not has_saved_secrets:
         try:
@@ -278,7 +282,10 @@ def menu(owner):
             InlineKeyboardButton("☁️ سرور کاماترا", callback_data="kamatera"),
             InlineKeyboardButton("☁️ سرور Linode", callback_data="linode"),
         ])
-        rows.append([InlineKeyboardButton("☁️ سرور هتزنر", callback_data="hetzner")])
+        rows.append([
+            InlineKeyboardButton("☁️ سرور هتزنر", callback_data="hetzner"),
+            InlineKeyboardButton("🌐 Cloudflare", callback_data="cloudflare"),
+        ])
         rows.append([
             InlineKeyboardButton("➕ افزودن ادمین", callback_data="add_admin"),
             InlineKeyboardButton(LABELS["update"], callback_data="update"),
@@ -1647,11 +1654,320 @@ async def hetzner_text(update, context):
         await message.reply_text("از دکمه‌های همین مرحله استفاده کن یا /cancel را بزن.")
 
 
+CF_FIELDS = {"name": "نام ساب‌دامنه", "content": "مقصد", "proxied": "Proxy", "ttl": "TTL"}
+
+
+def cf_token(user_id):
+    row = ADMIN_DB.execute("SELECT token FROM cloudflare_accounts WHERE user_id = ?", (user_id,)).fetchone()
+    return SERVER_CIPHER.decrypt(row[0]).decode() if row else None
+
+
+def cf_keyboard(state, rows):
+    return nonce_keyboard(state, rows, "cp")
+
+
+async def cf_picker(message, state, page=0):
+    prompt = "دامنه را انتخاب کن." if state["step"] == "zones" else f"ساب‌دامنه‌های {state['zone']['name']} را انتخاب کن."
+    await show_cloud_picker(message, state, page, prompt, "cp", "منوی Cloudflare", "cloudflare")
+
+
+async def cf_dns_menu(message, state):
+    state["step"] = "dns"
+    await message.reply_text(
+        f"مدیریت DNS · {state['zone']['name']}",
+        reply_markup=cf_keyboard(state, [
+            [("➕ افزودن ساب‌دامنه", "add"), ("✏️ تغییر ساب‌دامنه", "edit_list")],
+            [("🔍 جست‌وجوی ساب‌دامنه", "search"), ("📋 نمایش ساب‌دامنه‌ها", "list")],
+            [("تغییر دامنه", "zones")],
+        ]),
+    )
+
+
+async def cf_list_records(message, state, token, search="", *, editable=False):
+    zone = state["zone"]
+    records = await cloudflare.records(token, zone["id"], search)
+    state.update(step="records", choices=[
+        (row["id"], f"{row['name']} · {row['type']}")
+        for row in records if cloudflare.is_subdomain(row["name"], zone["name"])
+        and (not editable or row["type"] in cloudflare.HOST_TYPES)
+    ])
+    await cf_picker(message, state)
+
+
+async def cf_record_menu(message, state, token, record_id):
+    zone = state["zone"]
+    row = await cloudflare.record(token, zone["id"], record_id)
+    if not cloudflare.is_subdomain(row["name"], zone["name"]):
+        await cf_dns_menu(message, state)
+        return
+    state.update(step="record", record=row, changes={})
+    rows = []
+    if row["type"] in cloudflare.HOST_TYPES:
+        rows.append([("تغییر نام", "field:name"), ("تغییر مقصد", "field:content")])
+        settings = []
+        if row.get("proxiable"):
+            settings.append(("تغییر Proxy", "field:proxied"))
+        if not row.get("proxied"):
+            settings.append(("تغییر TTL", "field:ttl"))
+        if settings:
+            rows.append(settings)
+    rows.extend([[("🗑 حذف رکورد", "delete")], [("بازگشت به DNS", "dns")]])
+    await message.reply_text(
+        f"{row['name']} · {row['type']}\nمقصد: {str(row.get('content') or '—')[:1000]}\n"
+        f"Proxy: {'روشن' if row.get('proxied') else 'خاموش'}\nTTL: {cf_ttl_label(row.get('ttl'))}",
+        reply_markup=cf_keyboard(state, rows),
+    )
+
+
+def cf_ttl_label(value):
+    return "خودکار" if value == 1 else f"{value} ثانیه" if value is not None else "—"
+
+
+async def cf_input(message, state, field):
+    state["step"] = field
+    if field in {"name", "content"}:
+        state.pop("nonce", None)
+        if field == "name":
+            prompt = "نام ساب‌دامنه را بفرست، مثل app یا app.example.com."
+        else:
+            kind = state["form"]["type"] if state["mode"] == "create" else state["record"]["type"]
+            prompt = f"مقصد رکورد {kind} را بفرست."
+        await message.reply_text(prompt + " برای لغو /cancel را بزن.")
+        return
+    rows = (
+        [[("☁️ Proxy روشن", "proxy:on"), ("DNS only", "proxy:off")]]
+        if field == "proxied" else
+        [[(cf_ttl_label(value), f"ttl:{value}") for value in cloudflare.TTL_VALUES[i:i + 2]]
+         for i in range(0, len(cloudflare.TTL_VALUES), 2)]
+    )
+    rows.append([("انصراف", "dns")])
+    await message.reply_text(f"{CF_FIELDS[field]} را انتخاب کن.", reply_markup=cf_keyboard(state, rows))
+
+
+async def cf_review(message, state):
+    state["step"] = "review"
+    mode = state["mode"]
+    labels = {"create": "ساخت", "edit": "ویرایش", "delete": "حذف"}
+    current = state.get("record") or {}
+    fields = state["form"] if mode == "create" else state.get("changes", {})
+    row = {**current, **fields}
+    text = f"دامنه: {state['zone']['name']}\nعملیات: {labels[mode]} رکورد\nنام: {row['name']} · {row['type']}"
+    if row["name"] != current.get("name") and current:
+        text += f"\nنام قبلی: {current['name']}"
+    if mode != "delete":
+        text += (
+            f"\nمقصد: {row.get('content', '—')}\nProxy: {'روشن' if row.get('proxied') else 'خاموش'}"
+            f"\nTTL: {cf_ttl_label(row.get('ttl'))}"
+        )
+    await message.reply_text(
+        text, reply_markup=cf_keyboard(state, [[("تأیید", "confirm"), ("انصراف", "dns")]]),
+    )
+
+
+async def cf_commit(message, state, token):
+    state.pop("nonce", None)
+    zone = state["zone"]
+    mode = state["mode"]
+    if mode == "create":
+        await cloudflare.request("POST", cloudflare.records_path(zone["id"]), token, payload=state["form"])
+    else:
+        original = state["record"]
+        latest = await cloudflare.record(token, zone["id"], original["id"])
+        if not cloudflare.is_subdomain(latest["name"], zone["name"]) or any(
+            original.get(key) != latest.get(key)
+            for key in ("modified_on", "name", "type", "content", "proxied", "ttl")
+        ):
+            await message.reply_text("رکورد از زمان انتخاب تغییر کرده است. آن را دوباره انتخاب کن.")
+            await cf_dns_menu(message, state)
+            return
+        path = cloudflare.records_path(zone["id"], original["id"])
+        if mode == "delete":
+            await cloudflare.request("DELETE", path, token)
+        else:
+            await cloudflare.request("PATCH", path, token, payload=state["changes"])
+    await message.reply_text("تغییر DNS در Cloudflare ثبت شد.")
+    await cf_dns_menu(message, state)
+
+
+async def cloudflare_button(update, context):
+    query = update.callback_query
+    if not private_owner(update):
+        await query.answer()
+        return
+    action = query.data
+    state = context.user_data.get("cloudflare", {})
+    if action.startswith("cp:"):
+        _, nonce, action = action.split(":", 2)
+        if nonce != state.get("nonce"):
+            await query.answer("این منو بسته شده است.")
+            return
+    else:
+        clear(context)
+        state = {}
+        context.user_data["cloudflare"] = state
+    await query.answer()
+    message = query.message
+    if action == "cloudflare":
+        await message.reply_text("مدیریت Cloudflare", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("مدیریت DNS", callback_data="cf:zones")],
+            [InlineKeyboardButton("ثبت یا تعویض API Token", callback_data="cf:key")],
+            [InlineKeyboardButton("بازگشت", callback_data="cancel")],
+        ]))
+        return
+    if action == "cf:key":
+        state["step"] = "key"
+        await message.reply_text(
+            "API Token کلادفلر با دسترسی Zone Read و DNS Edit را بفرست. "
+            "ربات تلاش می‌کند پیام حاوی توکن را حذف کند."
+        )
+        return
+    try:
+        token = cf_token(update.effective_user.id)
+    except InvalidToken:
+        token = None
+    if not token:
+        await message.reply_text("ابتدا API Token را ثبت کن.")
+        return
+    try:
+        if action in {"cf:zones", "zones"}:
+            rows = await cloudflare.zones(token)
+            state.update(step="zones", choices=[(row, row["name"]) for row in rows])
+            await cf_picker(message, state)
+        elif action.startswith(("pick:", "page:")):
+            verb, raw = action.split(":")
+            index = int(raw)
+            if verb == "page":
+                if index * 8 < len(state["choices"]):
+                    await cf_picker(message, state, index)
+            elif index < len(state["choices"]):
+                value = state["choices"][index][0]
+                if state["step"] == "zones":
+                    state["zone"] = value
+                    await cf_dns_menu(message, state)
+                else:
+                    await cf_record_menu(message, state, token, value)
+        elif action in {"list", "edit_list"}:
+            await cf_list_records(message, state, token, editable=action == "edit_list")
+        elif action == "search":
+            state["step"] = "search"
+            state.pop("nonce", None)
+            await message.reply_text("تمام یا بخشی از نام ساب‌دامنه را بفرست. برای لغو /cancel را بزن.")
+        elif action == "dns":
+            await cf_dns_menu(message, state)
+        elif action == "add":
+            state.update(step="type", mode="create", form={}, record=None)
+            await message.reply_text("نوع رکورد را انتخاب کن.", reply_markup=cf_keyboard(state, [
+                [(kind, f"type:{kind}") for kind in cloudflare.HOST_TYPES], [("انصراف", "dns")],
+            ]))
+        elif action.startswith("type:"):
+            state["form"]["type"] = action.split(":")[1]
+            await cf_input(message, state, "name")
+        elif action.startswith("field:"):
+            state.update(mode="edit", changes={})
+            await cf_input(message, state, action.split(":")[1])
+        elif action.startswith("proxy:"):
+            values = state["form"] if state["mode"] == "create" else state["changes"]
+            values["proxied"] = action.endswith(":on")
+            if values["proxied"]:
+                values["ttl"] = 1
+            if state["mode"] == "create" and not values["proxied"]:
+                await cf_input(message, state, "ttl")
+            else:
+                await cf_review(message, state)
+        elif action.startswith("ttl:"):
+            values = state["form"] if state["mode"] == "create" else state["changes"]
+            values["ttl"] = int(action.split(":")[1])
+            await cf_review(message, state)
+        elif action == "delete":
+            state.update(mode="delete", changes={})
+            await cf_review(message, state)
+        elif action == "confirm":
+            await cf_commit(message, state, token)
+    except cloudflare.APIError as exc:
+        await cf_error(message, state, exc, action == "confirm")
+
+
+async def cf_error(message, state, exc, writing=False):
+    if writing and (exc.status is None or exc.status >= 500 or (200 <= exc.status < 300 and not exc.codes)):
+        text = "نتیجهٔ تغییر مشخص نیست. پیش از تکرار، فهرست رکوردها را بررسی کن."
+    else:
+        codes = ", ".join(str(code) for code in exc.codes)
+        text = "درخواست Cloudflare ناموفق بود." + (f" کد Cloudflare: {codes}" if codes else "")
+    markup = cf_keyboard(state, [[("بازگشت به DNS", "dns")]]) if state.get("zone") else None
+    await message.reply_text(text, reply_markup=markup)
+
+
+async def cloudflare_text(update, context):
+    message = update.message
+    state = context.user_data["cloudflare"]
+    step = state.get("step")
+    value = message.text.strip()
+    user_id = update.effective_user.id
+    if step == "key":
+        await delete_secret_message(message)
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,256}", value):
+            await message.reply_text("API Token را در یک خط بفرست.")
+            return
+        try:
+            await cloudflare.request("GET", "/zones", value, params={"per_page": 5})
+        except cloudflare.APIError:
+            await message.reply_text("توکن تأیید نشد. دسترسی Zone Read و محدودهٔ دامنه‌ها را بررسی کن.")
+            return
+        with ADMIN_DB:
+            ADMIN_DB.execute(
+                "INSERT INTO cloudflare_accounts VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET token=excluded.token",
+                (user_id, SERVER_CIPHER.encrypt(value.encode())),
+            )
+        clear(context)
+        await message.reply_text("توکن رمزگذاری و ذخیره شد.", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("مدیریت DNS", callback_data="cf:zones")],
+        ]))
+        return
+    if step == "search":
+        if not value or len(value) > 253 or not value.isprintable():
+            await message.reply_text("بخشی از نام ساب‌دامنه را در یک خط بفرست.")
+            return
+        try:
+            token = cf_token(user_id)
+            if not token:
+                raise cloudflare.APIError()
+            try:
+                search = cloudflare.domain(value, wildcard=True)
+            except ValueError:
+                search = value
+            await cf_list_records(message, state, token, search)
+        except InvalidToken:
+            await message.reply_text("توکن خوانده نشد. دوباره آن را ثبت کن.")
+        except cloudflare.APIError as exc:
+            await cf_error(message, state, exc)
+        return
+    if step not in {"name", "content"}:
+        await message.reply_text("از دکمه‌های همین مرحله استفاده کن یا /cancel را بزن.")
+        return
+    values = state["form"] if state["mode"] == "create" else state["changes"]
+    try:
+        if step == "name":
+            values["name"] = cloudflare.subdomain(value, state["zone"]["name"])
+        else:
+            kind = state["form"]["type"] if state["mode"] == "create" else state["record"]["type"]
+            values["content"] = cloudflare.destination(value, kind)
+    except (UnicodeError, ValueError):
+        await message.reply_text("مقدار معتبر نیست. دوباره بفرست.")
+        return
+    if state["mode"] == "edit":
+        await cf_review(message, state)
+    else:
+        await cf_input(message, state, "content" if step == "name" else "proxied")
+
+
 async def handle_text(update, context):
     if not private_admin(update):
         return
     state = context.user_data
     message = update.message
+    if private_owner(update) and "cloudflare" in state:
+        await cloudflare_text(update, context)
+        return
     if private_owner(update) and "hetzner" in state:
         await hetzner_text(update, context)
         return
@@ -1770,6 +2086,10 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("update", update_command))
     application.add_handler(CallbackQueryHandler(cancel, pattern=r"^cancel$"))
     application.add_handler(CallbackQueryHandler(select, pattern=r"^(ssh|node|on|off|update)$"))
+    application.add_handler(CallbackQueryHandler(
+        cloudflare_button,
+        pattern=r"^(?:cloudflare|cf:(?:key|zones)|cp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|zones|list|edit_list|search|dns|add|type:(?:A|AAAA|CNAME)|field:(?:name|content|proxied|ttl)|proxy:(?:on|off)|ttl:(?:1|60|300|600|1800|3600)|delete|confirm))$",
+    ))
     application.add_handler(CallbackQueryHandler(
         hetzner_button,
         pattern=r"^(?:hetzner|he:add|hp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|new|replace|accounts|poweron|shutdown|reboot|refresh|list|delete|password|reset_status|confirm))$",
