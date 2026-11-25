@@ -87,3 +87,22 @@ async def change_server(token, instance_id, operation):
     if operation not in POWER:
         raise ValueError("Invalid Hetzner server operation")
     return await request("POST", f"{path}/actions/{operation}", token)
+
+
+async def reset_root_password(token, instance_id):
+    result = await request("POST", f"/servers/{int(instance_id)}/actions/reset_password", token)
+    action = result.get("action")
+    if not isinstance(action, dict) or type(action.get("id")) is not int:
+        raise APIError()
+    password = result.get("root_password")
+    if action.get("status") != "error" and not (isinstance(password, str) and password):
+        raise APIError()
+    return action, password
+
+
+async def action_status(token, action_id):
+    result = await request("GET", f"/actions/{int(action_id)}", token)
+    action = result.get("action")
+    if not isinstance(action, dict) or action.get("id") != action_id:
+        raise APIError()
+    return action
