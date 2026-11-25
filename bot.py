@@ -636,8 +636,149 @@ async def kamatera_button(update, context):
         await message.reply_text("کاماترا دیتاسنتری برای این حساب برنگرداند.")
         return
     state["kamatera"] = {"step": "location", "locations": locations, "form": {}}
-    await message.reply_text("کد دیتاسنتر را از فهرست زیر بفرست.")
-    await send_code(message, "\n".join(f"{code}  {label}" for code, label in locations.items()))
+    await show_kamatera_create(message, state["kamatera"])
+
+
+CREATE_STEPS = ("location", "image", "cpu", "ram", "disk", "name")
+CREATE_PROMPTS = {
+    "location": "دیتاسنتر را انتخاب کن.",
+    "image": "ایمیج سیستم‌عامل را انتخاب کن.",
+    "cpu": "تعداد و نوع CPU را انتخاب کن.",
+    "ram": "مقدار رم را انتخاب کن.",
+    "disk": "حجم دیسک را انتخاب کن.",
+    "name": "نام VPS را بفرست.",
+}
+
+
+def kamatera_create_choices(draft):
+    step = draft["step"]
+    if step == "location":
+        return [(code, f"{label} · {code}" if label else code) for code, label in draft["locations"].items()]
+    if step == "image":
+        return [(key, str(image.get("description") or key)) for key, image in draft["images"].items()]
+    if step == "cpu":
+        return [(cpu, cpu) for cpu in draft["cpu_choices"]]
+    if step == "ram":
+        return [(ram, f"{ram} MB") for ram in draft["cpu_choices"][draft["form"]["cpu"]]]
+    if step == "disk":
+        return [(disk, f"{disk} GB") for disk in draft["disks"]]
+    return []
+
+
+async def show_kamatera_create(message, draft, page=0, *, edit=False, notice=None):
+    step = draft["step"]
+    choices = kamatera_create_choices(draft)
+    page_size = 8
+    offset = page * page_size
+    token = draft["picker"] = secrets.token_hex(8)
+    rows = [
+        [InlineKeyboardButton(label[:64], callback_data=f"kmc:{token}:pick:{index}")]
+        for index, (_, label) in enumerate(choices[offset:offset + page_size], offset)
+    ]
+    nav = []
+    if page:
+        nav.append(InlineKeyboardButton("◀ قبلی", callback_data=f"kmc:{token}:page:{page - 1}"))
+    if offset + page_size < len(choices):
+        nav.append(InlineKeyboardButton("بعدی ▶", callback_data=f"kmc:{token}:page:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    back = [InlineKeyboardButton("لغو", callback_data="cancel")]
+    if step != "location":
+        back.insert(0, InlineKeyboardButton("بازگشت", callback_data=f"kmc:{token}:back:0"))
+    rows.append(back)
+    prompt = CREATE_PROMPTS[step]
+    if notice:
+        prompt = notice + "\n\n" + prompt
+    send = message.edit_text if edit else message.reply_text
+    await send(prompt, reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def kamatera_create_button(update, context):
+    query = update.callback_query
+    if not private_owner(update):
+        await query.answer()
+        return
+    draft = context.user_data.get("kamatera", {})
+    _, token, action, raw_index = query.data.split(":")
+    if token != draft.get("picker") or draft.get("step") not in CREATE_STEPS:
+        await query.answer("این منو بسته شده است.")
+        return
+    await query.answer()
+    message = query.message
+    step = draft["step"]
+    if action == "back":
+        draft["step"] = CREATE_STEPS[CREATE_STEPS.index(step) - 1]
+        await show_kamatera_create(message, draft, edit=True)
+        return
+    index = int(raw_index)
+    choices = kamatera_create_choices(draft)
+    if action == "page":
+        if index * 8 < len(choices):
+            await show_kamatera_create(message, draft, index, edit=True)
+        return
+    if index >= len(choices):
+        return
+    value = choices[index][0]
+    form = draft["form"]
+    if step in {"location", "image"}:
+        try:
+            bearer = await kamatera_token(update.effective_user.id)
+            if step == "location":
+                data = await kamatera.options(bearer, "images/" + quote(value, safe=""))
+                if not isinstance(data, list):
+                    raise kamatera.APIError()
+                images = {i["id"]: i for i in data if isinstance(i, dict) and isinstance(i.get("id"), str)}
+                if not images:
+                    await show_kamatera_create(message, draft, index // 8, edit=True, notice="این دیتاسنتر ایمیجی ندارد.")
+                    return
+                draft["images"] = images
+                form["datacenter"] = value
+            else:
+                data = await kamatera.options(bearer, "image/" + quote(value, safe=""))
+                image = draft["images"][value]
+                cpu, disks = kamatera_sizes(data, image)
+                if not cpu or not disks:
+                    await show_kamatera_create(
+                        message, draft, index // 8, edit=True, notice="این ایمیج گزینهٔ سازگار برای ساخت ساعتی ندارد.",
+                    )
+                    return
+                draft.update(cpu_choices=cpu, disks=disks, image=str(image.get("description") or value))
+                form["disk_src_0"] = value
+        except (kamatera.APIError, InvalidToken):
+            await show_kamatera_create(message, draft, index // 8, edit=True, notice="دریافت گزینه‌ها ناموفق بود. دوباره تلاش کن.")
+            return
+    else:
+        form[{"cpu": "cpu", "ram": "ram", "disk": "disk_size_0"}[step]] = value
+    draft["step"] = CREATE_STEPS[CREATE_STEPS.index(step) + 1]
+    await show_kamatera_create(message, draft, edit=True)
+
+
+def kamatera_sizes(data, image):
+    if not isinstance(data, dict):
+        raise kamatera.APIError()
+    billing, cpu, ram, disk = (data.get(name) for name in ("billing", "cpu", "ram", "disk"))
+    if not isinstance(billing, list) or not isinstance(cpu, list) or not isinstance(ram, dict) or not isinstance(disk, list):
+        raise kamatera.APIError()
+    if "hourly" not in billing:
+        return {}, []
+    requirements = data.get("imageRequirements") or {}
+    try:
+        min_cpu = int(requirements.get("minCpu") or 0)
+        min_ram = int(requirements.get("minRamMb") or 0)
+        min_disk = max(int(requirements.get("minDiskSize") or 0), int(image.get("sizeGB") or 0))
+    except (AttributeError, ValueError, TypeError):
+        raise kamatera.APIError() from None
+    choices = {}
+    for option in cpu:
+        if not isinstance(option, str) or not re.fullmatch(r"[0-9]{1,4}[A-Z]", option) or int(option[:-1]) < min_cpu:
+            continue
+        sizes = ram.get(option[-1], [])
+        if not isinstance(sizes, list):
+            continue
+        compatible = sorted({size for size in sizes if type(size) is int and size >= max(1, min_ram)})
+        if compatible:
+            choices[option] = compatible
+    return choices, sorted({size for size in disk if type(size) is int and size >= max(1, min_disk)})
 
 
 POWER_LABELS = {"on": "روشن کردن", "off": "خاموش کردن", "restart": "ری‌استارت"}
@@ -810,69 +951,15 @@ async def kamatera_text(update, context):
         return
 
     form = draft["form"]
-    if step in {"location", "image"}:
-        try:
-            token = await kamatera_token(user_id)
-            if step == "location":
-                location = next((code for code in draft["locations"] if code.casefold() == value.casefold()), None)
-                if location is None:
-                    await message.reply_text("کد یکی از دیتاسنترهای فهرست را بفرست.")
-                    return
-                data = await kamatera.options(token, "images/" + quote(location, safe=""))
-                if not isinstance(data, list):
-                    raise kamatera.APIError()
-                images = {item["id"]: item for item in data if isinstance(item, dict) and isinstance(item.get("id"), str)}
-                if not images:
-                    await message.reply_text("برای این دیتاسنتر ایمیجی پیدا نشد. کد دیتاسنتر دیگری را بفرست.")
-                    return
-                form["datacenter"] = location
-                draft.update(step="image", images=images)
-                await message.reply_text("شناسهٔ ایمیج سیستم‌عامل را بفرست. برای دیدن فهرست محدودتر، نام سیستم‌عامل مثل Ubuntu را بنویس.")
-                await send_code(message, "\n".join(f"{i}  {item.get('description', '')}" for i, item in list(images.items())[:20]))
-                return
-            if value not in draft["images"]:
-                matches = [
-                    f"{key}  {image.get('description', '')}"
-                    for key, image in draft["images"].items()
-                    if value and value.casefold() in str(image.get("description", "")).casefold()
-                ]
-                if matches:
-                    await send_code(message, "\n".join(matches[:20]))
-                else:
-                    await message.reply_text("ایمیج پیدا نشد. شناسه یا بخشی از نام سیستم‌عامل را بفرست.")
-                return
-            data = await kamatera.options(token, "image/" + quote(value, safe=""))
-            if not isinstance(data, dict) or not {"cpu", "ram", "disk", "billing"} <= data.keys():
-                raise kamatera.APIError()
-        except (kamatera.APIError, InvalidToken):
-            await message.reply_text("دریافت گزینه‌ها ناموفق بود. دوباره تلاش کن.")
-            return
-        if "hourly" not in data["billing"]:
-            await message.reply_text("این ایمیج ساخت ساعتی ندارد. ایمیج دیگری انتخاب کن.")
-            return
-        image = draft["images"][value]
-        form["disk_src_0"] = value
-        draft.update(step="size", options=data, image=image.get("description", value), min_disk=image.get("sizeGB") or 0)
-        await message.reply_text("CPU، رم به مگابایت و دیسک به گیگابایت را با فاصله بفرست. در گزینه‌ها نوع رم باید با حرف آخر CPU یکی باشد.")
-        await send_code(message, f"CPU: {data['cpu']}\nRAM: {data['ram']}\nDisk: {data['disk']}\nMinimum image disk: {draft['min_disk']} GB")
-        return
-    if step == "size":
-        match = re.fullmatch(r"([1-9][0-9]{0,3}[A-Z])\s+([0-9]{1,7})\s+([0-9]{1,5})", value.upper())
-        if match:
-            cpu, ram, disk = match.groups()
-            opts = draft["options"]
-            if cpu in opts["cpu"] and int(ram) in opts["ram"].get(cpu[-1], []) and int(disk) in opts["disk"] and int(disk) >= int(draft["min_disk"]):
-                form.update(cpu=cpu, ram=int(ram), disk_size_0=int(disk))
-                draft["step"] = "name"
-                await message.reply_text("نام VPS را بفرست.")
-                return
-        await message.reply_text("ترکیب CPU، رم و دیسک را مطابق فهرست بفرست. نمونه: 2B 2048 30")
+    if step in CREATE_STEPS[:-1]:
+        await message.reply_text("برای انتخاب از دکمه‌های همین مرحله استفاده کن.")
         return
     if step == "name":
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}", value):
             await message.reply_text("نام سرور را با حروف انگلیسی، عدد، خط تیره یا زیرخط بفرست.")
             return
         form["name"] = value
+        draft.pop("picker", None)
         draft["step"] = "password"
         await message.reply_text("رمز اولیهٔ VPS را بفرست. ۹ تا ۳۲ کاراکتر با حرف کوچک، حرف بزرگ و عدد. ربات تلاش می‌کند پیام رمز را حذف کند.")
         return
@@ -1013,6 +1100,10 @@ if __name__ == "__main__":
     application.add_handler(CallbackQueryHandler(cancel, pattern=r"^cancel$"))
     application.add_handler(CallbackQueryHandler(select, pattern=r"^(ssh|node|on|off|update)$"))
     application.add_handler(CallbackQueryHandler(kamatera_button, pattern=r"^(kamatera|km:(key|new|servers|status|make:[a-f0-9]{16}))$"))
+    application.add_handler(CallbackQueryHandler(
+        kamatera_create_button,
+        pattern=r"^kmc:[a-f0-9]{16}:(?:pick|page|back):[0-9]{1,8}$",
+    ))
     application.add_handler(CallbackQueryHandler(
         kamatera_server_button,
         pattern=r"^kms:[a-f0-9]{16}:(?:(?:page|detail):[0-9]+|power:(?:on|off|restart)|(?:confirm|status):0)$",
