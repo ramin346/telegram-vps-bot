@@ -32,6 +32,7 @@ import database_backup
 import dns_rotation
 import hetzner
 import host_checks
+import host_monitor
 import kamatera
 import linode
 import vultr
@@ -244,6 +245,7 @@ def init_servers(db):
         """)
         db.execute("CREATE INDEX IF NOT EXISTS server_folder_members_by_folder ON server_folder_members(folder_id)")
     dns_rotation.init(db)
+    host_monitor.init(db)
     has_saved_secrets = db.execute("""
         SELECT 1 FROM servers WHERE secret IS NOT NULL
         UNION ALL SELECT 1 FROM kamatera_accounts
@@ -2856,6 +2858,7 @@ async def host_check_button(update, context):
         await query.message.reply_text("پینگ و اطلاعات IP", reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🇮🇷 پینگ از ایران", callback_data="hc:ping"),
              InlineKeyboardButton("ℹ️ اطلاعات IP", callback_data="hc:info")],
+            [InlineKeyboardButton("🕒 پایش سه‌ساعته", callback_data="hc:monitor")],
             [InlineKeyboardButton("بازگشت", callback_data="cancel")],
         ]))
         return
@@ -2922,6 +2925,145 @@ async def run_host_check(message, user_id, action, host):
         HOST_CHECKS_ACTIVE.discard(user_id)
 
 
+HOST_MONITORS_ACTIVE = set()
+
+
+async def host_monitor_menu(message, state, user_id, page=0):
+    hosts, next_at = host_monitor.get(ADMIN_DB, user_id)
+    state.update(step="list", hosts=hosts)
+    offset = page * 8
+    rows = [[("➕ افزودن ساب‌دامنه", "add"), ("⚡ تست درجا", "test")]]
+    rows.extend([(f"🗑 {host[:60]}", f"remove:{index}")] for index, host in enumerate(hosts[offset:offset + 8], offset))
+    nav = []
+    if page:
+        nav.append(("قبلی", f"page:{page - 1}"))
+    if offset + 8 < len(hosts):
+        nav.append(("بعدی", f"page:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    keyboard = nonce_keyboard(state, rows, "hm")
+    text = f"پایش از ایران هر سه ساعت · {len(hosts)} مقصد"
+    if next_at:
+        date = datetime.fromtimestamp(next_at, ZoneInfo("Asia/Tehran"))
+        text += f"\nبررسی بعدی: {date:%Y-%m-%d %H:%M} به وقت تهران"
+    if hosts:
+        text += "\nبرای حذف یک مقصد، دکمهٔ 🗑 کنار نام آن را بزن."
+    await message.reply_text(text, reply_markup=InlineKeyboardMarkup([
+        *keyboard.inline_keyboard, [InlineKeyboardButton("بازگشت", callback_data="host_checks")],
+    ]))
+
+
+async def host_monitor_button(update, context):
+    query = update.callback_query
+    if not private_admin(update):
+        await query.answer()
+        return
+    user_id = update.effective_user.id
+    message = query.message
+    if query.data == "hc:monitor":
+        await query.answer()
+        clear(context)
+        state = context.user_data["host_monitor"] = {}
+        await host_monitor_menu(message, state, user_id)
+        return
+    state = context.user_data.get("host_monitor", {})
+    _, nonce, action = query.data.split(":", 2)
+    if nonce != state.get("nonce"):
+        await query.answer("این منو بسته شده است.")
+        return
+    await query.answer()
+    if action == "add":
+        state.pop("nonce", None)
+        state["step"] = "add"
+        await message.reply_text("ساب‌دامنه‌ها را یک‌به‌یک در خط‌های جداگانه بفرست. برای لغو /cancel را بزن.")
+    elif action == "test":
+        hosts, _ = host_monitor.get(ADMIN_DB, user_id)
+        if not hosts:
+            await message.reply_text("اول یک ساب‌دامنه به فهرست پایش اضافه کن.")
+            return
+        if user_id in HOST_MONITORS_ACTIVE:
+            await message.reply_text("یک بررسی در حال اجراست.")
+            return
+        await message.reply_text("تست درجا شروع شد. گزارش در همین چت ارسال می‌شود.")
+        HOST_MONITORS_ACTIVE.add(user_id)
+        context.application.create_task(run_host_monitor(context.bot, user_id, hosts), update=update)
+    else:
+        verb, value = action.split(":")
+        index = int(value)
+        if verb == "page":
+            await host_monitor_menu(message, state, user_id, index)
+        elif index < len(state["hosts"]):
+            host = state["hosts"][index]
+            hosts, _ = host_monitor.get(ADMIN_DB, user_id)
+            host_monitor.save(ADMIN_DB, user_id, [item for item in hosts if item != host])
+            await host_monitor_menu(message, state, user_id)
+
+
+async def host_monitor_text(update, context):
+    state = context.user_data["host_monitor"]
+    message = update.message
+    if state.get("step") != "add":
+        await message.reply_text("برای مدیریت پایش از دکمه‌ها استفاده کن.")
+        return
+    try:
+        targets = [host_checks.parse_host(item) for item in message.text.split()]
+        if not targets:
+            raise ValueError
+    except ValueError:
+        await message.reply_text("یک یا چند ساب‌دامنه یا IP عمومی معتبر بفرست، بدون URL یا پورت.")
+        return
+    user_id = update.effective_user.id
+    existing, _ = host_monitor.get(ADMIN_DB, user_id)
+    host_monitor.save(ADMIN_DB, user_id, list(dict.fromkeys(existing + targets)))
+    await host_monitor_menu(message, state, user_id)
+
+
+async def send_monitor_report(bot, user_id, text):
+    chunk = ""
+    for line in text.splitlines(keepends=True):
+        if len(chunk) + len(line) > 3500:
+            await bot.send_message(chat_id=user_id, text=chunk.rstrip())
+            chunk = ""
+        chunk += line
+    if chunk:
+        await bot.send_message(chat_id=user_id, text=chunk.rstrip())
+
+
+async def run_host_monitor(bot, user_id, hosts, due_at=None):
+    try:
+        result = await host_monitor.run(hosts)
+        if user_id not in OWNER_IDS and user_id not in ADDED_ADMINS:
+            return
+        current, current_due = host_monitor.get(ADMIN_DB, user_id)
+        if current != hosts or (due_at is not None and current_due != due_at):
+            return
+        title = "📡 گزارش پایش سه‌ساعته" if due_at is not None else "⚡ نتیجهٔ تست درجا"
+        await send_monitor_report(bot, user_id, f"{title}\n\n{host_monitor.report(result)}")
+        if due_at is not None:
+            host_monitor.move_due(ADMIN_DB, user_id, due_at)
+    except TelegramError:
+        if due_at is not None:
+            host_monitor.move_due(ADMIN_DB, user_id, due_at, retry=True)
+        else:
+            raise
+    finally:
+        HOST_MONITORS_ACTIVE.discard(user_id)
+
+
+async def host_monitor_job(context):
+    runs = []
+    for (user_id,) in host_monitor.due(ADMIN_DB):
+        if user_id in HOST_MONITORS_ACTIVE:
+            continue
+        hosts, due_at = host_monitor.get(ADMIN_DB, user_id)
+        if user_id not in OWNER_IDS and user_id not in ADDED_ADMINS:
+            host_monitor.move_due(ADMIN_DB, user_id, due_at)
+            continue
+        HOST_MONITORS_ACTIVE.add(user_id)
+        runs.append(run_host_monitor(context.bot, user_id, hosts, due_at))
+    await asyncio.gather(*runs)
+
+
 async def handle_text(update, context):
     if not private_admin(update):
         return
@@ -2929,6 +3071,9 @@ async def handle_text(update, context):
     message = update.message
     if state.get("action") == "ssl" and "ssl_domain" not in state:
         await ssl_request_text(update, context)
+        return
+    if "host_monitor" in state:
+        await host_monitor_text(update, context)
         return
     if "host_check" in state:
         await host_check_text(update, context)
@@ -3065,6 +3210,9 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("update", update_command))
     application.add_handler(CallbackQueryHandler(cancel, pattern=r"^cancel$"))
     application.add_handler(CallbackQueryHandler(
+        host_monitor_button, pattern=r"^(?:hc:monitor|hm:[a-f0-9]{16}:(?:add|test|(?:remove|page):[0-9]{1,8}))$",
+    ))
+    application.add_handler(CallbackQueryHandler(
         host_check_button, pattern=r"^(?:host_checks|hc:(?:ping|info))$",
     ))
     application.add_handler(CallbackQueryHandler(select, pattern=r"^(ssh|node|ssl|on|off|update)$"))
@@ -3106,4 +3254,5 @@ if __name__ == "__main__":
     application.add_handler(MessageHandler(filters.TEXT, handle_text))
     application.add_error_handler(report_error)
     application.job_queue.run_repeating(dns_rotation_job, interval=15, first=1)
+    application.job_queue.run_repeating(host_monitor_job, interval=60, first=5)
     application.run_polling(drop_pending_updates=True, allowed_updates=["message", "callback_query"])

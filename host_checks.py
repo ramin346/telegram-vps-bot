@@ -103,7 +103,7 @@ def ping_summary(result):
     return f"{len(values)} از {len(packets)} پاسخ · میانگین {sum(values) / len(values):.1f} ms"
 
 
-async def ip_information(host):
+async def public_ips(host):
     try:
         addresses = [ip_address(host)]
     except ValueError:
@@ -114,13 +114,19 @@ async def ip_information(host):
         except (OSError, asyncio.TimeoutError):
             raise CheckError() from None
         addresses = sorted({ip_address(row[4][0]) for row in records}, key=lambda ip: (ip.version, int(ip)))
-    public = [ip for ip in addresses if ip.is_global and not ip.is_multicast][:3]
-    async with httpx.AsyncClient(timeout=8, follow_redirects=False) as client:
-        async def lookup(ip):
-            try:
-                data = await get_json(client, IP_INFO + "/" + quote(str(ip), safe=":"))
-            except CheckError:
-                data = {}
-            return str(ip), data if data.get("success") is True else {}
+    return [str(ip) for ip in addresses if ip.is_global and not ip.is_multicast]
 
-        return await asyncio.gather(*(lookup(ip) for ip in public))
+
+async def ip_metadata(client, ip):
+    try:
+        data = await get_json(client, IP_INFO + "/" + quote(ip, safe=":"))
+    except CheckError:
+        return {}
+    return data if data.get("success") is True else {}
+
+
+async def ip_information(host):
+    public = (await public_ips(host))[:3]
+    async with httpx.AsyncClient(timeout=8, follow_redirects=False) as client:
+        data = await asyncio.gather(*(ip_metadata(client, ip) for ip in public))
+    return list(zip(public, data))

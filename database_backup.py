@@ -3,6 +3,7 @@ import json
 import os
 
 import dns_rotation
+import host_monitor
 
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
@@ -21,6 +22,7 @@ TABLES = {
     "hetzner_projects": (("id", "i"), ("user_id", "i"), ("name", "t"), ("token", "s")),
     "cloudflare_accounts": (("user_id", "i"), ("token", "s")),
     "vultr_accounts": (("user_id", "i"), ("token", "s")),
+    "host_monitors": (("user_id", "i"), ("hosts", "t"), ("next_at", "i")),
     "dns_rotations": (("id", "i"), ("user_id", "i"), ("zone_id", "t"), ("record_id", "t"),
                       ("name", "t"), ("kind", "t"), ("expected", "t"), ("steps", "t"),
                       ("due_at", "i"), ("attempts", "n"), ("status", "t"), ("note", "t")),
@@ -72,7 +74,7 @@ def restore_file(data, password, storage_cipher):
     try:
         payload = password_cipher(password, data[len(MAGIC):end]).decrypt(data[end:])
         contents = json.loads(payload)
-        optional = {"dns_rotations", "vultr_accounts", "server_folders", "server_folder_members"}
+        optional = {"dns_rotations", "vultr_accounts", "server_folders", "server_folder_members", "host_monitors"}
         if not isinstance(contents, dict) or not TABLES.keys() - optional <= contents.keys() <= TABLES.keys():
             raise ValueError
         rows = {table: restore_rows(contents.get(table, []), columns, storage_cipher) for table, columns in TABLES.items()}
@@ -81,6 +83,10 @@ def restore_file(data, password, storage_cipher):
         for server_id, folder_id in rows["server_folder_members"]:
             if server_id not in servers or folder_id not in folders or servers[server_id] != folders[folder_id]:
                 raise ValueError
+        for _, hosts, next_at in rows["host_monitors"]:
+            if next_at > 253402200000:
+                raise ValueError
+            host_monitor.read_hosts(hosts)
         for fields in rows["dns_rotations"]:
             rotation = dns_rotation.Rotation(*fields)
             if rotation.status not in {"active", "done", "failed", "cancelled"} or rotation.due_at > 253402200000:
