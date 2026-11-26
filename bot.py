@@ -31,6 +31,7 @@ import cloudflare
 import database_backup
 import dns_rotation
 import hetzner
+import host_checks
 import kamatera
 import linode
 import vultr
@@ -307,7 +308,10 @@ def clear_user_data(state):
 def menu(owner):
     rows = [[InlineKeyboardButton(LABELS[name], callback_data=name)] for name in ("ssh", "node")]
     rows.append([InlineKeyboardButton(LABELS[name], callback_data=name) for name in ("on", "off")])
-    rows.append([InlineKeyboardButton("🖥 سرورهای من", callback_data="my_servers")])
+    rows.append([
+        InlineKeyboardButton("🖥 سرورهای من", callback_data="my_servers"),
+        InlineKeyboardButton("📡 پینگ و اطلاعات IP", callback_data="host_checks"),
+    ])
     if owner:
         rows.append([
             InlineKeyboardButton("☁️ سرور کاماترا", callback_data="kamatera"),
@@ -2734,11 +2738,93 @@ async def vultr_text(update, context):
         await message.reply_text("از دکمه‌های همین مرحله استفاده کن یا /cancel را بزن.")
 
 
+HOST_CHECKS_ACTIVE = set()
+
+
+async def host_check_button(update, context):
+    query = update.callback_query
+    await query.answer()
+    if not private_admin(update):
+        return
+    clear(context)
+    if query.data == "host_checks":
+        await query.message.reply_text("پینگ و اطلاعات IP", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🇮🇷 پینگ از ایران", callback_data="hc:ping"),
+             InlineKeyboardButton("ℹ️ اطلاعات IP", callback_data="hc:info")],
+            [InlineKeyboardButton("بازگشت", callback_data="cancel")],
+        ]))
+        return
+    context.user_data["host_check"] = query.data.split(":")[1]
+    await query.message.reply_text("یک IP عمومی یا نام دامنه بفرست. برای لغو /cancel را بزن.")
+
+
+async def host_check_text(update, context):
+    message = update.message
+    try:
+        host = host_checks.parse_host(message.text)
+    except ValueError:
+        await message.reply_text("فقط یک IP عمومی یا نام دامنه بفرست، بدون پورت یا آدرس کامل URL.")
+        return
+    user_id = update.effective_user.id
+    if user_id in HOST_CHECKS_ACTIVE:
+        await message.reply_text("هنوز درخواست قبلی‌ات در حال اجراست.")
+        return
+    action = context.user_data["host_check"]
+    await message.reply_text("در حال بررسی…")
+    clear(context)
+    HOST_CHECKS_ACTIVE.add(user_id)
+    context.application.create_task(run_host_check(message, user_id, action, host), update=update)
+
+
+async def run_host_check(message, user_id, action, host):
+    try:
+        if action == "ping":
+            nodes, results = await host_checks.ping_iran(host)
+            if not nodes:
+                text = "در حال حاضر هیچ نود ایرانی برای پینگ در دسترس نیست."
+            else:
+                lines = [f"🇮🇷 پینگ {host} از ایران"]
+                for node, city in sorted(nodes.items()):
+                    summary = host_checks.ping_summary(results.get(node))
+                    lines.append(f"{city} ({node.split('.')[0]}): {summary}")
+                text = "\n".join(lines)
+        else:
+            rows = await host_checks.ip_information(host)
+            if not rows:
+                text = "برای این مقصد IP عمومی پیدا نشد."
+            else:
+                sections = [f"ℹ️ اطلاعات IP · {host}"]
+                for ip, info in rows:
+                    if not info:
+                        sections.append(f"IP: {ip}\nاطلاعات موقعیت و شبکه در دسترس نیست.")
+                        continue
+                    connection = info.get("connection") or {}
+                    location = "، ".join(str(info[key])[:100] for key in ("country", "region", "city") if info.get(key))
+                    asn = connection.get("asn")
+                    organization = str(connection.get("org") or connection.get("isp") or "—")[:180]
+                    sections.append(
+                        f"IP: {ip}\nموقعیت تقریبی: {location or '—'}\n"
+                        f"شبکه: {('AS' + str(asn)) if asn else '—'} · {organization}"
+                    )
+                text = "\n\n".join(sections) + "\n\nمنبع اطلاعات IP: ipwho.is"
+        await message.reply_text(text, reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("بررسی دوباره", callback_data=f"hc:{action}"),
+             InlineKeyboardButton("بازگشت", callback_data="host_checks")],
+        ]))
+    except host_checks.CheckError:
+        await message.reply_text("دریافت نتیجه ناموفق بود. کمی بعد دوباره امتحان کن.")
+    finally:
+        HOST_CHECKS_ACTIVE.discard(user_id)
+
+
 async def handle_text(update, context):
     if not private_admin(update):
         return
     state = context.user_data
     message = update.message
+    if "host_check" in state:
+        await host_check_text(update, context)
+        return
     if state.get("folder_pending"):
         await create_server_folder(update, context)
         return
@@ -2868,6 +2954,9 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(CommandHandler("update", update_command))
     application.add_handler(CallbackQueryHandler(cancel, pattern=r"^cancel$"))
+    application.add_handler(CallbackQueryHandler(
+        host_check_button, pattern=r"^(?:host_checks|hc:(?:ping|info))$",
+    ))
     application.add_handler(CallbackQueryHandler(select, pattern=r"^(ssh|node|on|off|update)$"))
     application.add_handler(CallbackQueryHandler(
         vultr_button,
