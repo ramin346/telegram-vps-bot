@@ -72,6 +72,7 @@ SUDO ufw status
 LABELS = {
     "ssh": "💻 اجرای دستور SSH",
     "node": "📦 نصب نود پاسارگارد",
+    "ssl": "🔐 گرفتن گواهی SSL",
     "on": "🟢 روشن کردن UFW",
     "off": "🔴 خاموش کردن UFW",
     "update": "🔄 آپدیت ربات",
@@ -306,7 +307,7 @@ def clear_user_data(state):
 
 
 def menu(owner):
-    rows = [[InlineKeyboardButton(LABELS[name], callback_data=name)] for name in ("ssh", "node")]
+    rows = [[InlineKeyboardButton(LABELS[name], callback_data=name)] for name in ("ssh", "node", "ssl")]
     rows.append([InlineKeyboardButton(LABELS[name], callback_data=name) for name in ("on", "off")])
     rows.append([
         InlineKeyboardButton("🖥 سرورهای من", callback_data="my_servers"),
@@ -373,6 +374,9 @@ async def select(update, context):
         return
     clear(context)
     context.user_data["action"] = query.data
+    if query.data == "ssl":
+        await query.message.reply_text("ایمیل Certbot را بفرست. برای لغو /cancel را بزن.")
+        return
     await show_servers(update, context)
 
 
@@ -710,9 +714,110 @@ async def send_code(message, value, copy=False):
         await message.reply_text(f"<pre>{escape(chunk)}</pre>", parse_mode="HTML", reply_markup=keyboard)
 
 
+SSL_CERT_CHAIN = re.compile(
+    r"(?:-----BEGIN CERTIFICATE-----\n(?:[A-Za-z0-9+/=]+\n)+-----END CERTIFICATE-----\n+)+"
+)
+SSL_PRIVATE_KEY = re.compile(
+    r"-----BEGIN (PRIVATE KEY|RSA PRIVATE KEY|EC PRIVATE KEY)-----\n"
+    r"(?:[A-Za-z0-9+/=]+\n)+-----END \1-----\n"
+)
+SSL_EMAIL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._%+\-]{0,63}@[A-Za-z0-9.-]+")
+
+
+def ssl_domain(value):
+    domain = cloudflare.domain(value)
+    if "." not in domain or not any(char.isalpha() for char in domain.rsplit(".", 1)[-1]):
+        raise ValueError
+    return domain
+
+
+def issue_ssl_certificate(client, sudo, email, domain):
+    certbot_command = shlex.join([
+        "certbot", "certonly", "--standalone", "--non-interactive", "--agree-tos",
+        "--no-directory-hooks", "--keep-until-expiring", "--email", email,
+        "--cert-name", domain, "-d", domain,
+    ])
+    for command, timeout, label in (
+        ("apt update", 600, "apt update"),
+        ("env DEBIAN_FRONTEND=noninteractive apt install -y certbot", 600, "نصب Certbot"),
+        (certbot_command, 300, "صدور گواهی Certbot"),
+        ("certbot certificates", 90, "بررسی گواهی Certbot"),
+    ):
+        status, output = run(client, sudo + command, timeout=timeout)
+        if status:
+            return None, f"خطا در {label} (کد {status})\n{output.strip()[-3000:]}"
+
+    path = f"/etc/letsencrypt/live/{domain}"
+    pem_values = []
+    for filename, pattern in (("fullchain.pem", SSL_CERT_CHAIN), ("privkey.pem", SSL_PRIVATE_KEY)):
+        status, output = run(client, sudo + "cat -- " + shlex.quote(f"{path}/{filename}"))
+        pem = output.strip() + "\n"
+        if status or len(output) >= 65536 or not pattern.fullmatch(pem):
+            return None, f"خواندن کامل فایل {filename} ناموفق بود."
+        pem_values.append(pem)
+    return tuple(pem_values), None
+
+
+async def send_ssl_pem(message, label, value):
+    # Keep complete PEM lines and reserve space below Telegram's 4096-character limit.
+    chunks = [""]
+    for line in value.splitlines(keepends=True):
+        if len(chunks[-1]) + len(line) > 3500:
+            chunks.append("")
+        chunks[-1] += line
+    for index, chunk in enumerate(chunks, 1):
+        title = f"{label} ({index}/{len(chunks)})" if len(chunks) > 1 else label
+        markup = None
+        if len(chunks) == 1 and len(value) <= 256:
+            markup = InlineKeyboardMarkup([[InlineKeyboardButton("کپی", copy_text=CopyTextButton(value))]])
+        await message.reply_text(
+            f"{title}\n<pre>{escape(chunk)}</pre>", parse_mode="HTML", reply_markup=markup,
+        )
+
+
+async def ssl_request_text(update, context):
+    state = context.user_data
+    message = update.message
+    value = (message.text or "").strip()
+    if "ssl_email" not in state:
+        try:
+            if not SSL_EMAIL.fullmatch(value) or ".." in value or value.split("@")[0].endswith("."):
+                raise ValueError
+            email_domain = ssl_domain(value.split("@")[1])
+            email = value.split("@")[0] + "@" + email_domain
+            if len(email) > 254:
+                raise ValueError
+        except ValueError:
+            await message.reply_text("یک آدرس ایمیل معتبر بفرست.")
+            return
+        state["ssl_email"] = email
+        await message.reply_text("ساب‌دامنهٔ گواهی را بفرست. مثلاً node.example.com.")
+        return
+    try:
+        state["ssl_domain"] = ssl_domain(value)
+    except ValueError:
+        await message.reply_text("نام کامل دامنه یا ساب‌دامنه را بدون URL، پورت یا wildcard بفرست.")
+        return
+    await message.reply_text(
+        "برای ادامه، سروری را انتخاب کن که DNS این نام به آن اشاره می‌کند و پورت ۸۰ آن در دسترس است. "
+        "ادامهٔ صدور به معنی پذیرش شرایط Let’s Encrypt است."
+    )
+    await show_servers(update, context)
+
+
 async def operate(message, state, client, command=None):
     action = state["action"]
     sudo = "" if state["username"] == "root" else "sudo -n "
+    if action == "ssl":
+        pem, error = await asyncio.to_thread(
+            issue_ssl_certificate, client, sudo, state["ssl_email"], state["ssl_domain"],
+        )
+        if error:
+            await send_code(message, error)
+        else:
+            await send_ssl_pem(message, "Certificate content", pem[0])
+            await send_ssl_pem(message, "Key content", pem[1])
+        return
     if action == "node":
         await message.reply_text("نصب شروع شد. این مرحله ممکن است چند دقیقه طول بکشد.")
         status, data = await asyncio.to_thread(install_node, client, sudo)
@@ -2822,6 +2927,9 @@ async def handle_text(update, context):
         return
     state = context.user_data
     message = update.message
+    if state.get("action") == "ssl" and "ssl_domain" not in state:
+        await ssl_request_text(update, context)
+        return
     if "host_check" in state:
         await host_check_text(update, context)
         return
@@ -2921,6 +3029,7 @@ async def login_server(update, context, password, remember=True):
         )
         await message.reply_text("متصل شدی. هر پیام یک دستور جداگانه است. برای بستن اتصال /cancel را بزن.")
         return True
+    action = state["action"]
     try:
         await operate(message, state, client)
     except (OSError, paramiko.SSHException):
@@ -2928,7 +3037,8 @@ async def login_server(update, context, password, remember=True):
     finally:
         client.close()
         clear(context)
-    await message.reply_text("عملیات بعدی را انتخاب کن.", reply_markup=menu(private_owner(update)))
+    if action != "ssl":
+        await message.reply_text("عملیات بعدی را انتخاب کن.", reply_markup=menu(private_owner(update)))
     return True
 
 
@@ -2957,7 +3067,7 @@ if __name__ == "__main__":
     application.add_handler(CallbackQueryHandler(
         host_check_button, pattern=r"^(?:host_checks|hc:(?:ping|info))$",
     ))
-    application.add_handler(CallbackQueryHandler(select, pattern=r"^(ssh|node|on|off|update)$"))
+    application.add_handler(CallbackQueryHandler(select, pattern=r"^(ssh|node|ssl|on|off|update)$"))
     application.add_handler(CallbackQueryHandler(
         vultr_button,
         pattern=r"^(?:vultr|vu:(?:key|new|list)|vp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|start|halt|reboot|delete|password|refresh|list|confirm))$",
