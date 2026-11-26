@@ -21,6 +21,7 @@ class Rotation(NamedTuple):
     attempts: int
     status: str
     note: str
+    account_id: int | None
 
 
 def init(db):
@@ -34,6 +35,8 @@ def init(db):
                 status TEXT NOT NULL DEFAULT 'active', note TEXT NOT NULL DEFAULT ''
             )
         """)
+        if "account_id" not in {col[1] for col in db.execute("PRAGMA table_info(dns_rotations)")}:
+            db.execute("ALTER TABLE dns_rotations ADD COLUMN account_id INTEGER REFERENCES cloudflare_profiles(id)")
         db.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS dns_rotations_active
             ON dns_rotations (zone_id, record_id) WHERE status = 'active'
@@ -43,20 +46,20 @@ def init(db):
         """)
 
 
-def schedule(db, user_id, zone_id, record, steps):
+def schedule(db, user_id, zone_id, record, steps, account_id=None):
     due_at = int(time.time()) + steps[0][0]
     with db:
         return db.execute("""
-            INSERT INTO dns_rotations (user_id, zone_id, record_id, name, kind, expected, steps, due_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO dns_rotations (user_id, zone_id, record_id, name, kind, expected, steps, due_at, account_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (user_id, zone_id, record["id"], record["name"], record["type"], record["content"],
-              json.dumps(steps, separators=(",", ":")), due_at)).lastrowid
+              json.dumps(steps, separators=(",", ":")), due_at, account_id)).lastrowid
 
 
-def for_zone(db, user_id, zone_id):
+def for_zone(db, user_id, zone_id, account_id=None):
     return db.execute(
-        "SELECT id, name, status FROM dns_rotations WHERE user_id = ? AND zone_id = ? ORDER BY id DESC",
-        (user_id, zone_id),
+        "SELECT id, name, status FROM dns_rotations WHERE user_id = ? AND zone_id = ? AND account_id IS ? ORDER BY id DESC",
+        (user_id, zone_id, account_id),
     ).fetchall()
 
 
@@ -80,11 +83,11 @@ def stop(db, rotation, status, note=""):
         )
 
 
-def delete(db, user_id, zone_id, rotation_id):
+def delete(db, user_id, zone_id, rotation_id, account_id=None):
     with db:
         result = db.execute(
-            "DELETE FROM dns_rotations WHERE user_id = ? AND zone_id = ? AND id = ?",
-            (user_id, zone_id, rotation_id),
+            "DELETE FROM dns_rotations WHERE user_id = ? AND zone_id = ? AND id = ? AND account_id IS ?",
+            (user_id, zone_id, rotation_id, account_id),
         )
     return result.rowcount == 1
 

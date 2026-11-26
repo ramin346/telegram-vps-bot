@@ -243,6 +243,13 @@ def init_servers(db):
             )
         """)
         db.execute("CREATE INDEX IF NOT EXISTS server_folder_members_by_folder ON server_folder_members(folder_id)")
+    with db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS cloudflare_profiles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+                name TEXT COLLATE NOCASE NOT NULL, token BLOB NOT NULL, UNIQUE (user_id, name)
+            )
+        """)
     dns_rotation.init(db)
     host_monitor.init(db)
     has_saved_secrets = db.execute("""
@@ -251,6 +258,7 @@ def init_servers(db):
         UNION ALL SELECT 1 FROM linode_accounts
         UNION ALL SELECT 1 FROM hetzner_projects
         UNION ALL SELECT 1 FROM cloudflare_accounts
+        UNION ALL SELECT 1 FROM cloudflare_profiles
         UNION ALL SELECT 1 FROM vultr_accounts LIMIT 1
     """).fetchone()
     if not key_path.exists() and not has_saved_secrets:
@@ -2010,7 +2018,7 @@ async def dns_rotation_job(context):
             if not row or row.status != "active" or row.due_at > int(time.time()):
                 continue
             try:
-                token = cf_token(user_id) if user_has_access(user_id) else None
+                token = cf_token(user_id, row.account_id) if user_has_access(user_id) else None
             except InvalidToken:
                 token = None
             await dns_rotation.apply_step(ADMIN_DB, row, token)
@@ -2018,7 +2026,7 @@ async def dns_rotation_job(context):
 
 async def cf_rotation_list(message, state, user_id, page=0):
     if page == 0:
-        entries = dns_rotation.for_zone(ADMIN_DB, user_id, state["zone"]["id"])
+        entries = dns_rotation.for_zone(ADMIN_DB, user_id, state["zone"]["id"], state["account_id"])
         state.update(step="rotation_list", choices=[
             (rotation_id, f"{name} · {ROTATION_STATUS.get(status, status)}") for rotation_id, name, status in entries
         ])
@@ -2030,7 +2038,7 @@ async def cf_rotation_list(message, state, user_id, page=0):
 
 async def cf_rotation_details(message, state, user_id, rotation_id):
     row = dns_rotation.get(ADMIN_DB, user_id, rotation_id)
-    if not row or row.zone_id != state["zone"]["id"]:
+    if not row or (row.zone_id, row.account_id) != (state["zone"]["id"], state["account_id"]):
         await cf_rotation_list(message, state, user_id)
         return
     state.update(step="rotation_details", rotation_id=row.id, rotation_steps_shown=row.steps)
@@ -2123,7 +2131,7 @@ async def cf_rotation_button(message, state, token, user_id, action):
         async with ROTATION_LOCK:
             row = dns_rotation.get(ADMIN_DB, user_id, rotation_id)
             same_step = (
-                row and row.zone_id == state["zone"]["id"] and row.status == "active"
+                row and (row.zone_id, row.account_id) == (state["zone"]["id"], state["account_id"]) and row.status == "active"
                 and row.steps == state["rotation_steps_shown"]
             )
             if same_step:
@@ -2138,7 +2146,7 @@ async def cf_rotation_button(message, state, token, user_id, action):
         await cf_rotation_details(message, state, user_id, rotation_id)
     elif action == "rot_delete":
         row = dns_rotation.get(ADMIN_DB, user_id, state["rotation_id"])
-        if not row or row.zone_id != state["zone"]["id"]:
+        if not row or (row.zone_id, row.account_id) != (state["zone"]["id"], state["account_id"]):
             await cf_rotation_list(message, state, user_id)
             return
         await message.reply_text(
@@ -2150,14 +2158,14 @@ async def cf_rotation_button(message, state, token, user_id, action):
     elif action == "rot_remove":
         state.pop("nonce", None)
         async with ROTATION_LOCK:
-            removed = dns_rotation.delete(ADMIN_DB, user_id, state["zone"]["id"], state["rotation_id"])
+            removed = dns_rotation.delete(ADMIN_DB, user_id, state["zone"]["id"], state["rotation_id"], state["account_id"])
         if removed:
             await message.reply_text("برنامهٔ تعویض IP حذف شد.")
         await cf_rotation_list(message, state, user_id)
     elif action == "rot_cancel":
         async with ROTATION_LOCK:
             row = dns_rotation.get(ADMIN_DB, user_id, state["rotation_id"])
-            if row and row.zone_id == state["zone"]["id"]:
+            if row and (row.zone_id, row.account_id) == (state["zone"]["id"], state["account_id"]):
                 dns_rotation.stop(ADMIN_DB, row, "cancelled")
         await cf_rotation_details(message, state, user_id, state["rotation_id"])
     elif action == "rotate":
@@ -2184,7 +2192,9 @@ async def cf_rotation_button(message, state, token, user_id, action):
                     await cf_dns_menu(message, state)
                     return
                 latest["content"] = cloudflare.destination(latest["content"], latest["type"])
-                rotation_id = dns_rotation.schedule(ADMIN_DB, user_id, state["zone"]["id"], latest, state["rotation_steps"])
+                rotation_id = dns_rotation.schedule(
+                    ADMIN_DB, user_id, state["zone"]["id"], latest, state["rotation_steps"], state["account_id"],
+                )
         except sqlite3.IntegrityError:
             await message.reply_text("برای این رکورد از قبل برنامهٔ فعال وجود دارد.")
             await cf_rotation_list(message, state, user_id)
@@ -2195,9 +2205,46 @@ async def cf_rotation_button(message, state, token, user_id, action):
 CF_FIELDS = {"name": "نام ساب‌دامنه", "content": "مقصد", "proxied": "Proxy", "ttl": "TTL"}
 
 
-def cf_token(user_id):
-    row = ADMIN_DB.execute("SELECT token FROM cloudflare_accounts WHERE user_id = ?", (user_id,)).fetchone()
+def cf_token(user_id, account_id=None):
+    if account_id is None:
+        row = ADMIN_DB.execute("SELECT token FROM cloudflare_accounts WHERE user_id = ?", (user_id,)).fetchone()
+    else:
+        row = ADMIN_DB.execute(
+            "SELECT token FROM cloudflare_profiles WHERE user_id = ? AND id = ?", (user_id, account_id),
+        ).fetchone()
     return SERVER_CIPHER.decrypt(row[0]).decode() if row else None
+
+
+async def cf_account_list(message, state, user_id, page=0):
+    choices = ADMIN_DB.execute(
+        "SELECT id, name FROM cloudflare_profiles WHERE user_id = ? ORDER BY id", (user_id,),
+    ).fetchall()
+    if ADMIN_DB.execute("SELECT 1 FROM cloudflare_accounts WHERE user_id = ?", (user_id,)).fetchone():
+        choices.insert(0, (None, "پیش‌فرض"))
+    state.update(step="accounts", choices=choices)
+    await show_cloud_picker(
+        message, state, page, "حساب Cloudflare را انتخاب کن.", "cp", "➕ افزودن حساب", "cf:add",
+    )
+
+
+async def cf_account_menu(message, state):
+    state["step"] = "account"
+    await message.reply_text(
+        f"حساب Cloudflare: {state['account_name']}",
+        reply_markup=cf_keyboard(state, [
+            [("🌐 مدیریت DNS", "zones"), ("🔑 تعویض توکن همین حساب", "replace")],
+            [("تغییر حساب", "accounts")],
+        ]),
+    )
+
+
+async def cf_ask_token(message, state):
+    state["step"] = "key"
+    state.pop("nonce", None)
+    await message.reply_text(
+        f"API Token حساب «{state['account_name']}» را با دسترسی Zone Read و DNS Edit بفرست. "
+        "ربات تلاش می‌کند پیام حاوی توکن را حذف کند."
+    )
 
 
 def cf_keyboard(state, rows):
@@ -2205,18 +2252,19 @@ def cf_keyboard(state, rows):
 
 
 async def cf_picker(message, state, page=0):
-    prompt = "دامنه را انتخاب کن." if state["step"] == "zones" else f"ساب‌دامنه‌های {state['zone']['name']} را انتخاب کن."
+    prompt = f"حساب {state['account_name']} · دامنه را انتخاب کن." if state["step"] == "zones" else f"ساب‌دامنه‌های {state['zone']['name']} را انتخاب کن."
     await show_cloud_picker(message, state, page, prompt, "cp", "منوی Cloudflare", "cloudflare")
 
 
 async def cf_dns_menu(message, state):
     state["step"] = "dns"
     await message.reply_text(
-        f"مدیریت DNS · {state['zone']['name']}",
+        f"مدیریت DNS · {state['zone']['name']}\nحساب: {state['account_name']}",
         reply_markup=cf_keyboard(state, [
             [("➕ افزودن ساب‌دامنه", "add"), ("✏️ تغییر ساب‌دامنه", "edit_list")],
             [("🔍 جست‌وجوی ساب‌دامنه", "search"), ("📋 نمایش ساب‌دامنه‌ها", "list")],
             [("🕒 برنامه‌های تعویض IP", "rot_list"), ("تغییر دامنه", "zones")],
+            [("تغییر حساب", "accounts")],
         ]),
     )
 
@@ -2291,7 +2339,7 @@ async def cf_review(message, state):
     current = state.get("record") or {}
     fields = state["form"] if mode == "create" else state.get("changes", {})
     row = {**current, **fields}
-    text = f"دامنه: {state['zone']['name']}\nعملیات: {labels[mode]} رکورد\nنام: {row['name']} · {row['type']}"
+    text = f"حساب: {state['account_name']}\nدامنه: {state['zone']['name']}\nعملیات: {labels[mode]} رکورد\nنام: {row['name']} · {row['type']}"
     if row["name"] != current.get("name") and current:
         text += f"\nنام قبلی: {current['name']}"
     if mode != "delete":
@@ -2347,29 +2395,39 @@ async def cloudflare_button(update, context):
         context.user_data["cloudflare"] = state
     await query.answer()
     message = query.message
-    if action == "cloudflare":
-        await message.reply_text("مدیریت Cloudflare", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("مدیریت DNS", callback_data="cf:zones")],
-            [InlineKeyboardButton("ثبت یا تعویض API Token", callback_data="cf:key")],
-            [InlineKeyboardButton("بازگشت", callback_data="cancel")],
-        ]))
+    user_id = update.effective_user.id
+    if action in {"cloudflare", "cf:zones", "accounts"}:
+        state.clear()
+        await cf_account_list(message, state, user_id)
         return
-    if action == "cf:key":
-        state["step"] = "key"
-        await message.reply_text(
-            "API Token کلادفلر با دسترسی Zone Read و DNS Edit را بفرست. "
-            "ربات تلاش می‌کند پیام حاوی توکن را حذف کند."
-        )
+    if action in {"cf:key", "cf:add"}:
+        state["step"] = "account_name"
+        await message.reply_text("یک نام برای حساب Cloudflare بفرست. برای لغو /cancel را بزن.")
+        return
+    if state.get("step") == "accounts" and action.startswith(("pick:", "page:")):
+        verb, raw = action.split(":")
+        index = int(raw)
+        if verb == "page":
+            if index * 8 < len(state["choices"]):
+                await cf_account_list(message, state, user_id, index)
+        elif index < len(state["choices"]):
+            account_id, account_name = state["choices"][index]
+            state.clear()
+            state.update(account_id=account_id, account_name=account_name)
+            await cf_account_menu(message, state)
+        return
+    if action == "replace":
+        await cf_ask_token(message, state)
         return
     try:
-        token = cf_token(update.effective_user.id)
+        token = cf_token(user_id, state["account_id"])
     except InvalidToken:
         token = None
     if not token:
         await message.reply_text("ابتدا API Token را ثبت کن.")
         return
     try:
-        if action in {"cf:zones", "zones"}:
+        if action == "zones":
             rows = await cloudflare.zones(token)
             state.update(step="zones", choices=[(row, row["name"]) for row in rows])
             await cf_picker(message, state)
@@ -2451,6 +2509,18 @@ async def cloudflare_text(update, context):
     step = state.get("step")
     value = message.text.strip()
     user_id = update.effective_user.id
+    if step == "account_name":
+        if not 1 <= len(value) <= 40 or not value.isprintable():
+            await message.reply_text("نام حساب را در یک خط و حداکثر ۴۰ کاراکتر بفرست.")
+            return
+        if value == "پیش‌فرض" or ADMIN_DB.execute(
+            "SELECT 1 FROM cloudflare_profiles WHERE user_id = ? AND name = ?", (user_id, value),
+        ).fetchone():
+            await message.reply_text("این نام در دسترس نیست. نام دیگری بفرست.")
+            return
+        state["account_name"] = value
+        await cf_ask_token(message, state)
+        return
     if step == "key":
         await delete_secret_message(message)
         if not re.fullmatch(r"[A-Za-z0-9_-]{16,256}", value):
@@ -2461,15 +2531,24 @@ async def cloudflare_text(update, context):
         except cloudflare.APIError:
             await message.reply_text("توکن تأیید نشد. دسترسی Zone Read و محدودهٔ دامنه‌ها را بررسی کن.")
             return
-        with ADMIN_DB:
-            ADMIN_DB.execute(
-                "INSERT INTO cloudflare_accounts VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET token=excluded.token",
-                (user_id, SERVER_CIPHER.encrypt(value.encode())),
-            )
-        clear(context)
-        await message.reply_text("توکن رمزگذاری و ذخیره شد.", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("مدیریت DNS", callback_data="cf:zones")],
-        ]))
+        encrypted = SERVER_CIPHER.encrypt(value.encode())
+        async with ROTATION_LOCK:
+            with ADMIN_DB:
+                if "account_id" not in state:
+                    cursor = ADMIN_DB.execute(
+                        "INSERT INTO cloudflare_profiles (user_id, name, token) VALUES (?, ?, ?)",
+                        (user_id, state["account_name"], encrypted),
+                    )
+                    state["account_id"] = cursor.lastrowid
+                elif state["account_id"] is None:
+                    ADMIN_DB.execute("UPDATE cloudflare_accounts SET token = ? WHERE user_id = ?", (encrypted, user_id))
+                else:
+                    ADMIN_DB.execute(
+                        "UPDATE cloudflare_profiles SET token = ? WHERE user_id = ? AND id = ?",
+                        (encrypted, user_id, state["account_id"]),
+                    )
+        await message.reply_text("توکن این حساب رمزگذاری و ذخیره شد.")
+        await cf_account_menu(message, state)
         return
     if step in {"rotation_delay", "rotation_ip"}:
         await cf_rotation_text(message, state, value)
@@ -2479,7 +2558,7 @@ async def cloudflare_text(update, context):
             await message.reply_text("بخشی از نام ساب‌دامنه را در یک خط بفرست.")
             return
         try:
-            token = cf_token(user_id)
+            token = cf_token(user_id, state["account_id"])
             if not token:
                 raise cloudflare.APIError()
             try:
@@ -2628,7 +2707,7 @@ async def backup_text(update, context):
     await message.reply_text(
         f"بکاپ خوانده شد: {len(rows['servers'])} سرور ذخیره‌شده، "
         f"{len(rows['admins'])} ادمین اضافه‌شده و "
-        f"{sum(len(rows[name]) for name in ('kamatera_accounts', 'linode_accounts', 'hetzner_projects', 'cloudflare_accounts', 'vultr_accounts'))} حساب سرویس.\n"
+        f"{sum(len(rows[name]) for name in ('kamatera_accounts', 'linode_accounts', 'hetzner_projects', 'cloudflare_accounts', 'cloudflare_profiles', 'vultr_accounts'))} حساب سرویس.\n"
         "با تأیید، اطلاعات ذخیره‌شدهٔ فعلی ربات با اطلاعات این فایل جایگزین می‌شود.",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("تأیید جایگزینی دیتابیس", callback_data=confirmation)],
@@ -3260,7 +3339,7 @@ if __name__ == "__main__":
     ))
     application.add_handler(CallbackQueryHandler(
         cloudflare_button,
-        pattern=r"^(?:cloudflare|cf:(?:key|zones)|cp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|zones|list|edit_list|search|dns|add|type:(?:A|AAAA|CNAME)|field:(?:name|content|proxied|ttl)|proxy:(?:on|off)|ttl:(?:1|60|300|600|1800|3600)|delete|confirm|rotate|rot_(?:next|review|confirm|list|refresh|now|cancel|delete|remove|page:[0-9]{1,8})))$",
+        pattern=r"^(?:cloudflare|cf:(?:key|zones|add)|cp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|accounts|replace|zones|list|edit_list|search|dns|add|type:(?:A|AAAA|CNAME)|field:(?:name|content|proxied|ttl)|proxy:(?:on|off)|ttl:(?:1|60|300|600|1800|3600)|delete|confirm|rotate|rot_(?:next|review|confirm|list|refresh|now|cancel|delete|remove|page:[0-9]{1,8})))$",
     ))
     application.add_handler(CallbackQueryHandler(
         hetzner_button,
