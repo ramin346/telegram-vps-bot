@@ -19,8 +19,7 @@ from zoneinfo import ZoneInfo
 import paramiko
 from cryptography.fernet import Fernet, InvalidToken
 from telegram import (
-    CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
-    KeyboardButtonRequestUsers, ReplyKeyboardMarkup, ReplyKeyboardRemove,
+    CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup,
 )
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -287,11 +286,16 @@ def private_owner(update):
     )
 
 
+def private_operator(update):
+    return update.effective_chat.type == "private" and update.effective_user.id == MAIN_OWNER_ID
+
+
+def user_has_access(user_id):
+    return user_id in OWNER_IDS or user_id in ADDED_ADMINS
+
+
 def private_admin(update):
-    return (
-        update.effective_chat.type == "private"
-        and (update.effective_user.id in OWNER_IDS or update.effective_user.id in ADDED_ADMINS)
-    )
+    return update.effective_chat.type == "private" and user_has_access(update.effective_user.id)
 
 
 def clear(context):
@@ -315,30 +319,27 @@ def menu(owner):
         InlineKeyboardButton("🖥 سرورهای من", callback_data="my_servers"),
         InlineKeyboardButton("📡 پینگ و اطلاعات IP", callback_data="host_checks"),
     ])
+    rows.extend([
+        [InlineKeyboardButton("☁️ سرور کاماترا", callback_data="kamatera"),
+         InlineKeyboardButton("☁️ سرور Linode", callback_data="linode")],
+        [InlineKeyboardButton("☁️ سرور هتزنر", callback_data="hetzner"),
+         InlineKeyboardButton("☁️ سرور Vultr", callback_data="vultr")],
+        [InlineKeyboardButton("🌐 Cloudflare", callback_data="cloudflare")],
+    ])
     if owner:
-        rows.append([
-            InlineKeyboardButton("☁️ سرور کاماترا", callback_data="kamatera"),
-            InlineKeyboardButton("☁️ سرور Linode", callback_data="linode"),
-        ])
-        rows.append([
-            InlineKeyboardButton("☁️ سرور هتزنر", callback_data="hetzner"),
-            InlineKeyboardButton("🌐 Cloudflare", callback_data="cloudflare"),
-        ])
-        rows.append([
-            InlineKeyboardButton("➕ افزودن ادمین", callback_data="add_admin"),
-            InlineKeyboardButton(LABELS["update"], callback_data="update"),
-        ])
-        rows.append([
-            InlineKeyboardButton("☁️ سرور Vultr", callback_data="vultr"),
-            InlineKeyboardButton("💾 پشتیبان‌گیری و بازیابی", callback_data="backup"),
-        ])
+        rows.append([InlineKeyboardButton("👑 پنل مدیریت", callback_data="license_panel")])
     return InlineKeyboardMarkup(rows)
 
 
 async def start(update, context):
     if private_admin(update):
         clear(context)
-        await update.message.reply_text("عملیات سرور را انتخاب کن.", reply_markup=menu(private_owner(update)))
+        await update.message.reply_text("عملیات سرور را انتخاب کن.", reply_markup=menu(private_operator(update)))
+    elif update.effective_chat.type == "private":
+        await update.message.reply_text(
+            f"برای استفاده از ربات به لایسنس نیاز داری. آیدی عددی تو: {update.effective_user.id}\n"
+            "این آیدی را برای مدیر ربات بفرست تا دسترسی را فعال کند."
+        )
 
 
 async def update_bot(message, context):
@@ -361,7 +362,7 @@ async def update_bot(message, context):
 
 
 async def update_command(update, context):
-    if private_owner(update):
+    if private_operator(update):
         await update_bot(update.message, context)
 
 
@@ -371,7 +372,7 @@ async def select(update, context):
     if not private_admin(update) or query.data not in LABELS:
         return
     if query.data == "update":
-        if private_owner(update):
+        if private_operator(update):
             await update_bot(query.message, context)
         return
     clear(context)
@@ -626,54 +627,95 @@ async def server_button(update, context):
             await ask_password(query.message, private_owner(update))
 
 
-async def add_admin(update, context):
+async def license_panel(message):
+    await message.reply_text("👑 پنل مدیریت ربات", reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ فعال‌سازی لایسنس", callback_data="lic:add"),
+         InlineKeyboardButton("📋 لایسنس‌های فعال", callback_data="lic:list")],
+        [InlineKeyboardButton("💾 پشتیبان‌گیری و بازیابی", callback_data="backup"),
+         InlineKeyboardButton(LABELS["update"], callback_data="update")],
+        [InlineKeyboardButton("بازگشت", callback_data="cancel")],
+    ]))
+
+
+async def list_licenses(message, state, page=0):
+    choices = [(user_id, str(user_id)) for user_id in sorted(ADDED_ADMINS - OWNER_IDS)]
+    state["choices"] = choices
+    await show_cloud_picker(message, state, page, "لایسنس فعال را انتخاب کن.", "licp", "پنل مدیریت", "license_panel")
+
+
+async def license_button(update, context):
     query = update.callback_query
+    if not private_operator(update):
+        await query.answer()
+        return
+    message = query.message
+    action = query.data
+    state = context.user_data.get("license", {})
+    if action.startswith("licp:"):
+        _, nonce, action = action.split(":", 2)
+        if nonce != state.get("nonce"):
+            await query.answer("این منو بسته شده است.")
+            return
+    else:
+        clear(context)
+        state = context.user_data["license"] = {}
     await query.answer()
-    if not private_owner(update):
-        return
-    clear(context)
-    request_id = secrets.randbelow(2**31)
-    context.user_data["admin_request"] = request_id
-    chooser = KeyboardButton(
-        "انتخاب کاربر در تلگرام",
-        request_users=KeyboardButtonRequestUsers(request_id, user_is_bot=False, request_username=True),
-    )
-    await query.message.reply_text(
-        "آیدی عددی کاربر را بفرست یا با دکمهٔ پایین، کاربر را با نام کاربری پیدا و انتخاب کن. "
-        "برای برگشت /cancel را بزن.",
-        reply_markup=ReplyKeyboardMarkup([[chooser]], resize_keyboard=True, one_time_keyboard=True),
-    )
+    if action == "license_panel":
+        await license_panel(message)
+    elif action == "lic:add":
+        state["enter_id"] = True
+        await message.reply_text("آیدی عددی تلگرام کاربر را بفرست. برای لغو /cancel را بزن.")
+    elif action == "lic:list":
+        await list_licenses(message, state)
+    elif action.startswith("page:"):
+        page = int(action.split(":")[1])
+        if page * 8 < len(state["choices"]):
+            await list_licenses(message, state, page)
+    elif action.startswith("pick:"):
+        index = int(action.split(":")[1])
+        if index >= len(state["choices"]):
+            return
+        user_id = state["choices"][index][0]
+        state["revoke_id"] = user_id
+        await message.reply_text(
+            f"لایسنس {user_id} فعال است. دسترسی این کاربر لغو شود؟",
+            reply_markup=nonce_keyboard(state, [[("لغو لایسنس", "revoke"), ("انصراف", "back")]], "licp"),
+        )
+    elif action == "back":
+        await list_licenses(message, state)
+    elif action == "revoke":
+        state.pop("nonce", None)
+        user_id = state.pop("revoke_id")
+        async with ROTATION_LOCK:
+            with ADMIN_DB:
+                ADMIN_DB.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
+                ADMIN_DB.execute(
+                    "UPDATE dns_rotations SET status = 'cancelled', note = ? WHERE user_id = ? AND status = 'active'",
+                    ("لایسنس کاربر لغو شد.", user_id),
+                )
+            ADDED_ADMINS.discard(user_id)
+            user_state = context.application.user_data.get(user_id)
+            if user_state is not None:
+                clear_user_data(user_state)
+        await message.reply_text(f"لایسنس {user_id} لغو شد.")
+        await list_licenses(message, state)
 
 
-async def grant_admin(update, context, user_id):
-    try:
-        with ADMIN_DB:
-            if user_id not in OWNER_IDS:
-                ADMIN_DB.execute("INSERT OR IGNORE INTO admins VALUES (?)", (user_id,))
-    except sqlite3.Error:
-        await update.message.reply_text("ذخیرهٔ ادمین ناموفق بود. دوباره تلاش کن.")
+async def activate_license(update, context):
+    value = update.message.text.strip()
+    if not re.fullmatch(r"\d{1,16}", value) or not 0 < int(value) < 2**52:
+        await update.message.reply_text("فقط آیدی عددی معتبر تلگرام را بفرست.")
         return
+    user_id = int(value)
+    if user_id in OWNER_IDS:
+        await update.message.reply_text("این کاربر از قبل دسترسی ادمین اصلی دارد. آیدی دیگری بفرست.")
+        return
+    with ADMIN_DB:
+        ADMIN_DB.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (user_id,))
     ADDED_ADMINS.add(user_id)
     clear(context)
-    await update.message.reply_text(
-        f"دسترسی آیدی {user_id} فعال است. کاربر می‌تواند /start را در چت خصوصی ربات بزند.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    await update.message.reply_text("عملیات بعدی را انتخاب کن.", reply_markup=menu(True))
-
-
-async def shared_admin(update, context):
-    if not private_owner(update):
-        return
-    shared = update.message.users_shared
-    state = context.user_data
-    if shared.request_id != state.get("admin_request") or len(shared.users) != 1:
-        return
-    user = shared.users[0]
-    if "admin_username" in state and (user.username or "").lower() != state["admin_username"]:
-        await update.message.reply_text("نام کاربری انتخاب‌شده مطابقت ندارد. کاربر درست را انتخاب کن.")
-        return
-    await grant_admin(update, context, user.user_id)
+    await update.message.reply_text(f"لایسنس {user_id} فعال است. کاربر می‌تواند /start را در چت خصوصی ربات بزند.")
+    await license_panel(update.message)
 
 
 async def cancel(update, context):
@@ -681,10 +723,8 @@ async def cancel(update, context):
         return
     if update.callback_query:
         await update.callback_query.answer()
-    if "admin_request" in context.user_data:
-        await update.effective_message.reply_text("افزودن ادمین لغو شد.", reply_markup=ReplyKeyboardRemove())
     clear(context)
-    await update.effective_message.reply_text("اتصال بسته شد. عملیات بعدی را انتخاب کن.", reply_markup=menu(private_owner(update)))
+    await update.effective_message.reply_text("اتصال بسته شد. عملیات بعدی را انتخاب کن.", reply_markup=menu(private_operator(update)))
 
 
 def parse_address(value):
@@ -860,7 +900,7 @@ async def kamatera_token(user_id):
 async def kamatera_button(update, context):
     query = update.callback_query
     await query.answer()
-    if not private_owner(update):
+    if not private_admin(update):
         return
     message = query.message
     user_id = update.effective_user.id
@@ -1012,7 +1052,7 @@ async def show_kamatera_create(message, draft, page=0, *, edit=False, notice=Non
 
 async def kamatera_create_button(update, context):
     query = update.callback_query
-    if not private_owner(update):
+    if not private_admin(update):
         await query.answer()
         return
     draft = context.user_data.get("kamatera", {})
@@ -1151,7 +1191,7 @@ def kamatera_operation_controls(state, index, status_label):
 
 async def kamatera_server_button(update, context):
     query = update.callback_query
-    if not private_owner(update):
+    if not private_admin(update):
         await query.answer()
         return
     state = context.user_data.get("kamatera_servers")
@@ -1393,7 +1433,7 @@ async def show_linode_details(message, state, token):
 
 async def linode_button(update, context):
     query = update.callback_query
-    if not private_owner(update):
+    if not private_admin(update):
         await query.answer()
         return
     message = query.message
@@ -1669,7 +1709,7 @@ async def show_hetzner_server(message, state, token):
 
 async def hetzner_button(update, context):
     query = update.callback_query
-    if not private_owner(update):
+    if not private_admin(update):
         await query.answer()
         return
     state = context.user_data.get("hetzner", {})
@@ -1970,7 +2010,7 @@ async def dns_rotation_job(context):
             if not row or row.status != "active" or row.due_at > int(time.time()):
                 continue
             try:
-                token = cf_token(user_id) if user_id in OWNER_IDS else None
+                token = cf_token(user_id) if user_has_access(user_id) else None
             except InvalidToken:
                 token = None
             await dns_rotation.apply_step(ADMIN_DB, row, token)
@@ -2291,7 +2331,7 @@ async def cf_commit(message, state, token):
 
 async def cloudflare_button(update, context):
     query = update.callback_query
-    if not private_owner(update):
+    if not private_admin(update):
         await query.answer()
         return
     action = query.data
@@ -2473,7 +2513,7 @@ async def cloudflare_text(update, context):
 
 async def backup_button(update, context):
     query = update.callback_query
-    if not private_owner(update):
+    if not private_operator(update):
         await query.answer()
         return
     await query.answer()
@@ -2518,7 +2558,7 @@ async def backup_button(update, context):
 
 
 async def backup_document(update, context):
-    if not private_owner(update):
+    if not private_operator(update):
         return
     state = context.user_data.get("backup", {})
     if state.get("step") != "document":
@@ -2648,7 +2688,7 @@ async def show_vultr_password(message, state, password, title):
 
 async def vultr_button(update, context):
     query = update.callback_query
-    if not private_owner(update):
+    if not private_admin(update):
         await query.answer()
         return
     action = query.data
@@ -3032,7 +3072,7 @@ async def send_monitor_report(bot, user_id, text):
 async def run_host_monitor(bot, user_id, hosts, due_at=None):
     try:
         result = await host_monitor.run(hosts)
-        if user_id not in OWNER_IDS and user_id not in ADDED_ADMINS:
+        if not user_has_access(user_id):
             return
         current, current_due = host_monitor.get(ADMIN_DB, user_id)
         if current != hosts or (due_at is not None and current_due != due_at):
@@ -3056,7 +3096,7 @@ async def host_monitor_job(context):
         if user_id in HOST_MONITORS_ACTIVE:
             continue
         hosts, due_at = host_monitor.get(ADMIN_DB, user_id)
-        if user_id not in OWNER_IDS and user_id not in ADDED_ADMINS:
+        if not user_has_access(user_id):
             host_monitor.move_due(ADMIN_DB, user_id, due_at)
             continue
         HOST_MONITORS_ACTIVE.add(user_id)
@@ -3081,39 +3121,32 @@ async def handle_text(update, context):
     if state.get("folder_pending"):
         await create_server_folder(update, context)
         return
-    if private_owner(update) and "vultr" in state:
+    if "vultr" in state:
         await vultr_text(update, context)
         return
-    if private_owner(update) and "backup" in state:
+    if private_operator(update) and "backup" in state:
         await backup_text(update, context)
         return
-    if private_owner(update) and "cloudflare" in state:
+    if "cloudflare" in state:
         await cloudflare_text(update, context)
         return
-    if private_owner(update) and "hetzner" in state:
+    if "hetzner" in state:
         await hetzner_text(update, context)
         return
-    if private_owner(update) and "linode" in state:
+    if "linode" in state:
         await linode_text(update, context)
         return
-    if private_owner(update) and "kamatera" in state:
+    if "kamatera" in state:
         await kamatera_text(update, context)
         return
-    if private_owner(update) and "admin_request" in state:
-        value = message.text.strip()
-        if re.fullmatch(r"[0-9]{1,16}", value) and 0 < int(value) < 2**52:
-            await grant_admin(update, context, int(value))
-        elif re.fullmatch(r"@?[A-Za-z0-9_]{1,32}", value):
-            state["admin_username"] = value.lstrip("@").lower()
-            await message.reply_text("همین نام کاربری را با دکمهٔ «انتخاب کاربر در تلگرام» پیدا و تأیید کن.")
-        else:
-            await message.reply_text("آیدی عددی یا نام کاربری معتبر بفرست.")
+    if private_operator(update) and state.get("license", {}).get("enter_id"):
+        await activate_license(update, context)
         return
     if "action" not in state or "servers_token" in state:
         return
     if "client" in state and time.monotonic() >= state["expires"]:
         clear(context)
-        await message.reply_text("مهلت اتصال تمام شد.", reply_markup=menu(private_owner(update)))
+        await message.reply_text("مهلت اتصال تمام شد.", reply_markup=menu(private_operator(update)))
         return
     if "address" not in state:
         try:
@@ -3183,7 +3216,7 @@ async def login_server(update, context, password, remember=True):
         client.close()
         clear(context)
     if action != "ssl":
-        await message.reply_text("عملیات بعدی را انتخاب کن.", reply_markup=menu(private_owner(update)))
+        await message.reply_text("عملیات بعدی را انتخاب کن.", reply_markup=menu(private_operator(update)))
     return True
 
 
@@ -3201,7 +3234,9 @@ async def report_error(update, context):
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.WARNING)
-    OWNER_IDS = {int(value) for value in os.environ["TELEGRAM_ADMIN_IDS"].split(",")}
+    configured_owners = [int(value) for value in os.environ["TELEGRAM_ADMIN_IDS"].split(",")]
+    MAIN_OWNER_ID = configured_owners[0]
+    OWNER_IDS = set(configured_owners)
     ADMIN_DB, ADDED_ADMINS = load_admins()
     SERVER_CIPHER = init_servers(ADMIN_DB)
     application = Application.builder().token(os.environ["TELEGRAM_BOT_TOKEN"]).build()
@@ -3248,8 +3283,10 @@ if __name__ == "__main__":
         server_button,
         pattern=r"^s:[0-9a-f]{12}:(?:pick|page|new|connect|delete|folder_new|folders_page|folder|move|move_page|move_to):[0-9]{1,19}$",
     ))
-    application.add_handler(CallbackQueryHandler(add_admin, pattern=r"^add_admin$"))
-    application.add_handler(MessageHandler(filters.StatusUpdate.USERS_SHARED, shared_admin))
+    application.add_handler(CallbackQueryHandler(
+        license_button,
+        pattern=r"^(?:license_panel|lic:(?:add|list)|licp:[a-f0-9]{16}:(?:(?:page|pick):[0-9]{1,8}|back|revoke))$",
+    ))
     application.add_handler(MessageHandler(filters.Document.ALL, backup_document))
     application.add_handler(MessageHandler(filters.TEXT, handle_text))
     application.add_error_handler(report_error)
