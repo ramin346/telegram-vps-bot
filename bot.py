@@ -27,6 +27,7 @@ from telegram.ext import (
 )
 
 import cloudflare
+import cloud_saved
 import database_backup
 import dns_rotation
 import hetzner
@@ -250,6 +251,7 @@ def init_servers(db):
                 name TEXT COLLATE NOCASE NOT NULL, token BLOB NOT NULL, UNIQUE (user_id, name)
             )
         """)
+    cloud_saved.init(db)
     dns_rotation.init(db)
     host_monitor.init(db)
     has_saved_secrets = db.execute("""
@@ -259,7 +261,8 @@ def init_servers(db):
         UNION ALL SELECT 1 FROM hetzner_projects
         UNION ALL SELECT 1 FROM cloudflare_accounts
         UNION ALL SELECT 1 FROM cloudflare_profiles
-        UNION ALL SELECT 1 FROM vultr_accounts LIMIT 1
+        UNION ALL SELECT 1 FROM vultr_accounts
+        UNION ALL SELECT 1 FROM cloud_saved_pending WHERE secret IS NOT NULL LIMIT 1
     """).fetchone()
     if not key_path.exists() and not has_saved_secrets:
         try:
@@ -487,12 +490,17 @@ async def show_servers(update, context, page=0):
     folder_id = state.get("folder_id")
     if folder_id is None:
         rows = ADMIN_DB.execute(
-            "SELECT id, host, port, username FROM servers WHERE user_id = ? ORDER BY id DESC LIMIT 9 OFFSET ?",
+            """
+            SELECT s.id, s.host, s.port, s.username, n.name FROM servers s
+            LEFT JOIN cloud_saved_names n ON n.server_id = s.id
+            WHERE s.user_id = ? ORDER BY s.id DESC LIMIT 9 OFFSET ?
+            """,
             (user_id, page * 8),
         ).fetchall()
     else:
         rows = ADMIN_DB.execute("""
-            SELECT s.id, s.host, s.port, s.username FROM servers s
+            SELECT s.id, s.host, s.port, s.username, n.name FROM servers s
+            LEFT JOIN cloud_saved_names n ON n.server_id = s.id
             LEFT JOIN server_folder_members m ON m.server_id = s.id
             WHERE s.user_id = ? AND COALESCE(m.folder_id, 0) = ?
             ORDER BY s.id DESC LIMIT 9 OFFSET ?
@@ -504,8 +512,8 @@ async def show_servers(update, context, page=0):
         return
     token = server_list_token(state)
     keyboard = [
-        [InlineKeyboardButton(server_label(host, port, username)[:64], callback_data=f"s:{token}:pick:{row_id}")]
-        for row_id, host, port, username in rows[:8]
+        [InlineKeyboardButton((f"{name} · {host}" if name else server_label(host, port, username))[:64], callback_data=f"s:{token}:pick:{row_id}")]
+        for row_id, host, port, username, name in rows[:8]
     ]
     navigation = []
     if page:
@@ -525,6 +533,13 @@ async def show_servers(update, context, page=0):
         ).fetchone()
         name = folder[0] if folder else "بدون پوشه"
         title = f"📂 {name}\n{title}"
+        if folder_id:
+            counts = ADMIN_DB.execute("""
+                SELECT status, COUNT(*) FROM cloud_saved_pending
+                WHERE user_id = ? AND folder_id = ? GROUP BY status
+            """, (user_id, folder_id)).fetchall()
+            for status, count in counts:
+                title += f"\n{count} سرور منتظر IP" if status == "pending" else f"\nدریافت IP برای {count} سرور ناموفق بود."
     await message.reply_text(
         title,
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -905,6 +920,78 @@ async def kamatera_token(user_id):
     return await kamatera.authenticate(client_id, secret)
 
 
+def store_created_server(user_id, provider, remote_id, region, name, *, instance=None, password=None,
+                         account_id=None, username="root"):
+    address = cloud_saved.instance_address(provider, instance) if instance else None
+    secret = SERVER_CIPHER.encrypt(password.encode()) if isinstance(password, str) and password else None
+    try:
+        cloud_saved.add(
+            ADMIN_DB, user_id, provider, remote_id, region, name, username, secret,
+            account_id=account_id, address=address,
+        )
+    except sqlite3.Error:
+        return "VPS ساخته شد، اما ذخیرهٔ آن در «سرورهای من» ناموفق بود."
+    if address:
+        return f"در «سرورهای من ← {region}» ذخیره شد."
+    return f"پس از تخصیص IP، در «سرورهای من ← {region}» ذخیره می‌شود."
+
+
+async def kamatera_created_instance(pending):
+    token = await kamatera_token(pending.user_id)
+    command = await kamatera.command_status(token, pending.remote_id)
+    if command["status"] != "complete":
+        return None, command["status"] == "error"
+    match = re.search(r"^Name:\s*([^\r\n]+)", str(command.get("log") or ""), re.M)
+    name = match[1].strip() if match else command.get("server") or pending.name
+    candidates = [
+        row for row in await kamatera.list_servers(token)
+        if row.get("name") == name and str(row.get("datacenter")).casefold() == pending.region.casefold()
+    ]
+    if len(candidates) != 1:
+        return None, False
+    return await kamatera.server_details(token, candidates[0]["id"]), False
+
+
+async def resolve_created_server(pending):
+    user_id = pending.user_id
+    if not user_has_access(user_id):
+        cloud_saved.finish(ADMIN_DB, pending, failed=True)
+        return
+    failed = False
+    instance = None
+    try:
+        if pending.provider == "kamatera":
+            instance, failed = await kamatera_created_instance(pending)
+        elif pending.provider == "linode":
+            token = linode_token(user_id)
+            if token:
+                instance = await linode.details(token, int(pending.remote_id))
+        elif pending.provider == "hetzner":
+            token = hetzner_token(user_id, pending.account_id)
+            if token:
+                instance = await hetzner.server_details(token, int(pending.remote_id))
+        elif pending.provider == "vultr":
+            token = vultr_token(user_id)
+            if token:
+                instance = await vultr.details(token, pending.remote_id)
+    except (kamatera.APIError, linode.APIError, hetzner.APIError, vultr.APIError, InvalidToken):
+        pass
+    address = cloud_saved.instance_address(pending.provider, instance) if instance else None
+    secret = None
+    if address and pending.provider == "vultr":
+        password = instance.get("default_password")
+        if isinstance(password, str) and password:
+            secret = SERVER_CIPHER.encrypt(password.encode())
+    if not user_has_access(user_id):
+        cloud_saved.finish(ADMIN_DB, pending, failed=True)
+        return
+    cloud_saved.finish(ADMIN_DB, pending, address, secret, failed=failed)
+
+
+async def cloud_saved_job(context):
+    await asyncio.gather(*(resolve_created_server(pending) for pending in cloud_saved.due(ADMIN_DB)))
+
+
 async def kamatera_button(update, context):
     query = update.callback_query
     await query.answer()
@@ -942,8 +1029,12 @@ async def kamatera_button(update, context):
         except sqlite3.Error:
             await message.reply_text(f"درخواست ساخت ثبت شد، اما ذخیرهٔ شناسه در ربات ناموفق بود. شناسه: {command_id}")
             return
+        storage = store_created_server(
+            user_id, "kamatera", command_id, form["datacenter"], form["name"], password=form["password"],
+            username="Administrator" if "windows" in draft["image"].casefold() else "root",
+        )
         await message.reply_text(
-            f"درخواست ساخت ثبت شد. شناسهٔ عملیات: {command_id}",
+            f"درخواست ساخت ثبت شد. شناسهٔ عملیات: {command_id}\n{storage}",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بررسی وضعیت", callback_data="km:status")]]),
         )
         return
@@ -1531,9 +1622,13 @@ async def linode_button(update, context):
             form = state.pop("form")
             clear(context)
             result = await linode.create(token, form)
+            storage = store_created_server(
+                user_id, "linode", result["id"], form["region"], form["label"],
+                instance=result, password=form["root_pass"],
+            )
             await message.reply_text(
                 f"درخواست ساخت Linode ثبت شد. شناسه: {result.get('id', '—')}. "
-                "برای دیدن IP و وضعیت به «سرورهای موجود» برو."
+                f"\n{storage}"
             )
         elif step == "delete_confirm":
             instance_id = state["instance"]
@@ -1806,7 +1901,7 @@ async def hetzner_button(update, context):
             ]))
             return
         elif action == "confirm":
-            await hetzner_confirm(message, context, state, token)
+            await hetzner_confirm(message, context, state, token, user_id)
             return
         else:
             return
@@ -1865,7 +1960,7 @@ async def hetzner_pick(message, state, token, index):
     await show_hetzner_picker(message, state)
 
 
-async def hetzner_confirm(message, context, state, token):
+async def hetzner_confirm(message, context, state, token, user_id):
     state.pop("nonce", None)
     account = {key: state[key] for key in ("account_id", "account_name")}
     if state["step"] == "create_confirm":
@@ -1874,12 +1969,16 @@ async def hetzner_confirm(message, context, state, token):
         result = await hetzner.create(token, form)
         instance_id = result["server"]["id"]
         password = result.get("root_password")
+        storage = store_created_server(
+            user_id, "hetzner", instance_id, form["location"], form["name"],
+            instance=result["server"], password=password, account_id=account["account_id"],
+        )
         if password:
             instance_state = {**account, "step": "instance", "instance": instance_id, "name": form["name"]}
             context.user_data["hetzner"] = instance_state
             controls = hetzner_keyboard(instance_state, [[("🔑 بازنشانی رمز root", "password")]])
             await message.reply_text(
-                f"درخواست ساخت سرور {instance_id} ثبت شد. رمز اولیهٔ root را ذخیره کن:\n{password}",
+                f"درخواست ساخت سرور {instance_id} ثبت شد.\n{storage}\n\nرمز اولیهٔ root:\n{password}",
                 protect_content=True,
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("کپی رمز", copy_text=CopyTextButton(password))],
@@ -1889,7 +1988,7 @@ async def hetzner_confirm(message, context, state, token):
         else:
             context.user_data["hetzner"] = account
             await message.reply_text(
-                f"درخواست ساخت سرور {instance_id} ثبت شد.",
+                f"درخواست ساخت سرور {instance_id} ثبت شد.\n{storage}",
                 reply_markup=hetzner_keyboard(account, [[("سرورهای موجود", "list")]]),
             )
         return
@@ -2838,7 +2937,7 @@ async def vultr_button(update, context):
                 text, reply_markup=vultr_keyboard(state, [[("تأیید", "confirm"), ("انصراف", "refresh")]]),
             )
         elif action == "confirm":
-            await vultr_confirm(message, context, state, token)
+            await vultr_confirm(message, context, state, token, update.effective_user.id)
     except vultr.APIError as exc:
         text = "درخواست Vultr ناموفق بود."
         if action == "confirm" and (exc.status is None or exc.status >= 500):
@@ -2879,16 +2978,20 @@ async def vultr_pick(message, state, token, index):
     await vultr_picker(message, state)
 
 
-async def vultr_confirm(message, context, state, token):
+async def vultr_confirm(message, context, state, token, user_id):
     state.pop("nonce", None)
     if state["step"] == "create_confirm":
         form = state["form"]
         clear(context)
         instance = await vultr.create(token, form)
+        storage = store_created_server(
+            user_id, "vultr", instance["id"], form["region"], form["label"],
+            instance=instance, password=instance.get("default_password"),
+        )
         state = {"step": "instance", "instance": instance["id"], "label": form["label"]}
         context.user_data["vultr"] = state
         await show_vultr_password(message, state, instance.get("default_password"),
-                                  f"درخواست ساخت VPS ثبت شد. شناسه: {instance['id']}")
+                                  f"درخواست ساخت VPS ثبت شد. شناسه: {instance['id']}\n{storage}")
         return
     operation = state["operation"]
     await vultr.change_instance(token, state["instance"], operation)
@@ -3371,4 +3474,5 @@ if __name__ == "__main__":
     application.add_error_handler(report_error)
     application.job_queue.run_repeating(dns_rotation_job, interval=15, first=1)
     application.job_queue.run_repeating(host_monitor_job, interval=60, first=5)
+    application.job_queue.run_repeating(cloud_saved_job, interval=60, first=10)
     application.run_polling(drop_pending_updates=True, allowed_updates=["message", "callback_query"])
