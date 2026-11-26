@@ -79,6 +79,14 @@ async def set_power(token, server_id, power):
     return parse_command_id(result)
 
 
+async def terminate_server(token, server_id):
+    result = await request(
+        "DELETE", "/server/" + quote(server_id, safe="") + "/terminate",
+        token=token, payload={"confirm": 1, "force": 1},
+    )
+    return parse_command_id(result)
+
+
 async def command_status(token, command_id):
     result = await request("GET", "/queue/" + quote(command_id, safe=""), token=token)
     if not isinstance(result, dict) or not isinstance(result.get("status"), str):

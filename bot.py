@@ -1025,6 +1025,19 @@ async def show_kamatera_servers(message, state, page=0):
     )
 
 
+def kamatera_operation_controls(state, index, status_label):
+    rows = [[(status_label, "status:0")]]
+    if not state["deleting"]:
+        rows[0].append(("وضعیت سرور", f"detail:{index}"))
+    markup = kamatera_controls(state, rows)
+    if state["deleting"]:
+        return InlineKeyboardMarkup([
+            *markup.inline_keyboard,
+            [InlineKeyboardButton("به‌روزرسانی فهرست سرورها", callback_data="km:servers")],
+        ])
+    return markup
+
+
 async def kamatera_server_button(update, context):
     query = update.callback_query
     if not private_owner(update):
@@ -1053,19 +1066,30 @@ async def kamatera_server_button(update, context):
             ]),
         )
         return
+    if action == "delete":
+        await message.reply_text(
+            f"سرور «{name}» با شناسهٔ {server_id} و داده‌های آن برای همیشه حذف می‌شوند. "
+            "اگر سرور روشن باشد، کاماترا آن را هم متوقف می‌کند.",
+            reply_markup=kamatera_controls(state, [
+                [("🗑 تأیید حذف دائمی", "confirm:delete"), ("انصراف", f"detail:{index}")],
+            ]),
+        )
+        return
     if action == "confirm":
-        power = state.pop("power")
         state["token"] = None
     try:
         bearer = await kamatera_token(update.effective_user.id)
         if action == "confirm":
-            command_id = await kamatera.set_power(bearer, server_id, power)
-            state["command_id"] = command_id
+            deleting = value == "delete"
+            if deleting:
+                command_id = await kamatera.terminate_server(bearer, server_id)
+            else:
+                command_id = await kamatera.set_power(bearer, server_id, state.pop("power"))
+            state.update(command_id=command_id, deleting=deleting)
+            label = "درخواست حذف ثبت شد" if deleting else "درخواست ثبت شد"
             await message.reply_text(
-                f"درخواست ثبت شد. شناسهٔ عملیات: {command_id}",
-                reply_markup=kamatera_controls(state, [
-                    [("وضعیت عملیات", "status:0"), ("وضعیت سرور", f"detail:{index}")],
-                ]),
+                f"{label}. شناسهٔ عملیات: {command_id}",
+                reply_markup=kamatera_operation_controls(state, index, "وضعیت عملیات"),
             )
             return
         if action == "status":
@@ -1073,9 +1097,7 @@ async def kamatera_server_button(update, context):
             status = {"complete": "انجام شد", "error": "ناموفق بود"}.get(result["status"], "در صف یا در حال انجام")
             await message.reply_text(
                 f"عملیات {state['command_id']} — {status}",
-                reply_markup=kamatera_controls(state, [
-                    [("بررسی دوباره", "status:0"), ("وضعیت سرور", f"detail:{index}")],
-                ]),
+                reply_markup=kamatera_operation_controls(state, index, "بررسی دوباره"),
             )
             return
         detail = await kamatera.server_details(bearer, server_id)
@@ -1092,6 +1114,7 @@ async def kamatera_server_button(update, context):
         return
 
     state["selected"] = index
+    server["name"] = str(detail.get("name") or name)[:120]
     networks = detail.get("networks") or []
     addresses = [
         ip for network in networks if isinstance(network, dict)
@@ -1106,6 +1129,7 @@ async def kamatera_server_button(update, context):
         f"تعرفه: {detail.get('billing') or '—'}",
         reply_markup=kamatera_controls(state, [
             [(label, f"power:{power}") for power, label in POWER_LABELS.items()],
+            [("🗑 حذف سرور", "delete:0")],
             [("تازه‌سازی وضعیت", f"detail:{index}"), ("بازگشت به فهرست", f"page:{index // 8}")],
         ]),
     )
@@ -2870,7 +2894,7 @@ if __name__ == "__main__":
     ))
     application.add_handler(CallbackQueryHandler(
         kamatera_server_button,
-        pattern=r"^kms:[a-f0-9]{16}:(?:(?:page|detail):[0-9]+|power:(?:on|off|restart)|(?:confirm|status):0)$",
+        pattern=r"^kms:[a-f0-9]{16}:(?:(?:page|detail):[0-9]+|power:(?:on|off|restart)|(?:confirm|status|delete):0|confirm:delete)$",
     ))
     application.add_handler(CallbackQueryHandler(my_servers, pattern=r"^my_servers$"))
     application.add_handler(CallbackQueryHandler(
