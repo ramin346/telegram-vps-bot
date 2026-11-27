@@ -42,6 +42,7 @@ import kamatera
 import linode
 import navigation
 import pasarguard
+import panel_install
 import replacement
 import vultr
 
@@ -124,13 +125,15 @@ def connect(host, port, username, password=None, pkey=None):
     return client
 
 
-def run(client, command, timeout=90):
+def run(client, command, timeout=90, input_data=None):
     transport = client.get_transport()
     deadline = time.monotonic() + timeout
     with transport.open_session(timeout=15) as channel:
         channel.settimeout(15)
         channel.set_combine_stderr(True)
         channel.exec_command(command)
+        if input_data is not None:
+            channel.sendall(input_data)
         channel.shutdown_write()
         tail = bytearray()
         while time.monotonic() < deadline:
@@ -543,6 +546,9 @@ async def show_servers(update, context, page=0):
         """, (user_id, folder_id, page * 8)).fetchall()
     if not rows and page:
         return await show_servers(update, context, page - 1)
+    if not rows and state.get("action") == "panel_install":
+        await message.reply_text("ابتدا سرور را در «سرورهای من» ذخیره کن.", reply_markup=panel_menu())
+        return
     if not rows and state.get("action"):
         await ask_address(message)
         return
@@ -558,7 +564,7 @@ async def show_servers(update, context, page=0):
         navigation.append(InlineKeyboardButton("بعدی", callback_data=f"s:{token}:page:{page + 1}"))
     if navigation:
         keyboard.append(navigation)
-    if state.get("action"):
+    if state.get("action") and state["action"] != "panel_install":
         keyboard.append([InlineKeyboardButton("➕ سرور جدید", callback_data=f"s:{token}:new:0")])
     back = "cancel" if folder_id is None else f"s:{token}:folders_page:0"
     keyboard.append([InlineKeyboardButton("بازگشت", callback_data=back)])
@@ -686,6 +692,11 @@ async def server_button(update, context):
         state.pop("servers_token")
         state["password_only"] = True
         await ask_password(query.message, owner=False)
+        return
+    if verb == "pick" and action == "panel_install":
+        state.pop("servers_token")
+        state.update(address=(host, port), username=username, saved_server_id=server_id, panel_install_step="domain")
+        await query.message.reply_text("ساب‌دامنهٔ پنل را بفرست. مثلاً panel.example.com.")
         return
     if verb == "connect" or (verb == "pick" and action):
         state.pop("servers_token")
@@ -928,6 +939,21 @@ async def ssl_request_text(update, context):
 async def operate(message, state, client, command=None):
     action = state["action"]
     sudo = "" if state["username"] == "root" else "sudo -n "
+    if action == "panel_install":
+        await message.reply_text("نصب پنل شروع شد. این مرحله ممکن است چند دقیقه طول بکشد.")
+        try:
+            url, username, password = await asyncio.to_thread(
+                panel_install.install, run, client, sudo, state["panel_domain"], state["panel_email"],
+            )
+        except panel_install.InstallError as error:
+            await message.reply_text(str(error))
+            return
+        for label, value in (("آدرس ورود", url), ("نام کاربری", username), ("رمز مدیر", password)):
+            await message.reply_text(
+                f"{label}\n<pre>{escape(value)}</pre>", parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("کپی", copy_text=CopyTextButton(value))]]),
+            )
+        return
     if action == "ssl":
         pem, error = await asyncio.to_thread(
             issue_ssl_certificate, client, sudo, state["ssl_email"], state["ssl_domain"],
@@ -1613,10 +1639,89 @@ async def offer_panel_registration(message, client, sudo, api_key, cert):
 
 def panel_menu():
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📦 نصب پاسارگارد", callback_data="pg:install")],
         [InlineKeyboardButton("🔑 تنظیم اتصال پنل", callback_data="pg:key")],
         [InlineKeyboardButton("🎯 اینباند پیش‌فرض Host نودها", callback_data="pg:default")],
         [InlineKeyboardButton("🔀 تغییر اینباند Host موجود", callback_data="pg:hosts")],
     ])
+
+
+async def panel_install_text(update, context):
+    state = context.user_data
+    message = update.message
+    value = message.text.strip()
+    step = state["panel_install_step"]
+    if step == "domain":
+        try:
+            state["panel_domain"] = ssl_domain(value)
+        except ValueError:
+            await message.reply_text("نام کامل ساب‌دامنه را بدون URL یا پورت بفرست.")
+            return
+        state["panel_install_step"] = "email"
+        await message.reply_text("ایمیل صدور گواهی Let’s Encrypt را بفرست.")
+    elif step == "email":
+        try:
+            if len(value) > 254 or not SSL_EMAIL.fullmatch(value) or ".." in value:
+                raise ValueError
+            local, domain = value.split("@")
+            if local.endswith("."):
+                raise ValueError
+            state["panel_email"] = f"{local}@{ssl_domain(domain)}"
+        except ValueError:
+            await message.reply_text("یک آدرس ایمیل معتبر بفرست.")
+            return
+        state["panel_install_step"] = "confirm"
+        nonce = state["panel_install_nonce"] = secrets.token_hex(8)
+        host, port = state["address"]
+        await message.reply_text(
+            f"پنل روی {server_label(host, port, state['username'])} نصب شود؟\n"
+            f"ساب‌دامنه: {state['panel_domain']}\nایمیل گواهی: {state['panel_email']}\n"
+            "DNS ساب‌دامنه باید به سرور اشاره کند. پورت ۸۰ برای صدور گواهی و ۸۰۰۰ برای پنل باید از اینترنت در دسترس باشند. "
+            "ادامه به معنی پذیرش شرایط Let’s Encrypt است.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ تأیید نصب", callback_data=f"pg:install:confirm:{nonce}"),
+            ]]),
+        )
+    else:
+        await message.reply_text("برای شروع نصب، دکمهٔ تأیید را بزن.")
+
+
+async def panel_install_button(update, context):
+    query = update.callback_query
+    await query.answer()
+    if not private_admin(update):
+        return
+    state = context.user_data
+    if query.data == "pg:install":
+        clear(context)
+        state["action"] = "panel_install"
+        await show_servers(update, context)
+        return
+    if (state.get("panel_install_step") != "confirm"
+            or query.data.rsplit(":", 1)[1] != state.get("panel_install_nonce")):
+        await query.message.reply_text("این درخواست نصب منقضی شده است.", reply_markup=panel_menu())
+        return
+    row = ADMIN_DB.execute(
+        "SELECT host, port, username, secret FROM servers WHERE user_id = ? AND id = ?",
+        (update.effective_user.id, state["saved_server_id"]),
+    ).fetchone()
+    if not row or row[:3] != (*state["address"], state["username"]):
+        clear(context)
+        await query.message.reply_text("سرور انتخاب‌شده تغییر کرده است. دوباره انتخابش کن.", reply_markup=panel_menu())
+        return
+    state["panel_install_step"] = "connect"
+    secret = row[3]
+    if secret is None and not (private_owner(update) and os.getenv("SSH_KEY_PATH")):
+        await ask_password(query.message, private_owner(update))
+        return
+    try:
+        password = SERVER_CIPHER.decrypt(secret).decode() if secret is not None else None
+    except InvalidToken:
+        await query.message.reply_text("رمز ذخیره‌شده خوانده نشد.")
+        await show_saved_password_retry(query.message, state)
+        return
+    if not await login_server(update, context, password, remember=False):
+        await show_saved_password_retry(query.message, state)
 
 
 async def panel_credentials_text(update, context):
@@ -4423,6 +4528,9 @@ async def handle_text(update, context):
         return
     state = context.user_data
     message = update.message
+    if state.get("panel_install_step") in {"domain", "email", "confirm"}:
+        await panel_install_text(update, context)
+        return
     if "pasarguard" in state and state["pasarguard"]["step"] == "credentials":
         await panel_credentials_text(update, context)
         return
@@ -4542,7 +4650,9 @@ async def login_server(update, context, password, remember=True):
     finally:
         client.close()
         clear(context)
-    if action != "ssl":
+    if action == "panel_install":
+        await message.reply_text("پنل پاسارگارد", reply_markup=panel_menu())
+    elif action != "ssl":
         await message.reply_text("عملیات بعدی را انتخاب کن.", reply_markup=menu(private_operator(update)))
     return True
 
@@ -4593,6 +4703,7 @@ if __name__ == "__main__":
     add(CallbackQueryHandler(
         host_check_button, pattern=r"^(?:host_checks|hc:(?:ping|info))$",
     ))
+    add(CallbackQueryHandler(panel_install_button, pattern=r"^pg:install(?::confirm:[a-f0-9]{16})?$"))
     add(CallbackQueryHandler(select, pattern=r"^(ssh|node|ssl|on|off|update)$"))
     add(CallbackQueryHandler(
         panel_button,
