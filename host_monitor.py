@@ -11,6 +11,8 @@ import host_checks
 
 INTERVAL = 3 * 60 * 60
 RETRY_INTERVAL = 5 * 60
+MIN_INTERVAL = 15 * 60
+MAX_INTERVAL = 30 * 86400
 AWS_RANGES = "https://ip-ranges.amazonaws.com/ip-ranges.json"
 AWS_NAME = re.compile(r"\b(?:amazon|aws|amzn)\b", re.IGNORECASE)
 PROBE_LIMIT = asyncio.Semaphore(3)
@@ -23,6 +25,32 @@ def init(db):
                 user_id INTEGER PRIMARY KEY, hosts TEXT NOT NULL, next_at INTEGER NOT NULL
             )
         """)
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS host_monitor_settings (
+                user_id INTEGER PRIMARY KEY, interval INTEGER NOT NULL
+            )
+        """)
+
+
+def interval(db, user_id):
+    row = db.execute("SELECT interval FROM host_monitor_settings WHERE user_id = ?", (user_id,)).fetchone()
+    return row[0] if row else INTERVAL
+
+
+def set_interval(db, user_id, seconds):
+    if not MIN_INTERVAL <= seconds <= MAX_INTERVAL:
+        raise ValueError
+    next_at = int(time.time()) + seconds
+    with db:
+        db.execute("""
+            INSERT INTO host_monitor_settings VALUES (?, ?)
+            ON CONFLICT (user_id) DO UPDATE SET interval = excluded.interval
+        """, (user_id, seconds))
+        db.execute("UPDATE host_monitors SET next_at = ? WHERE user_id = ?", (next_at, user_id))
+        db.execute("""
+            UPDATE node_replacements SET next_at = ?, evidence = 0 WHERE user_id = ? AND state = 'watching'
+        """, (next_at, user_id))
 
 
 def read_hosts(value):
@@ -47,7 +75,7 @@ def save(db, user_id, hosts):
         db.execute("""
             INSERT INTO host_monitors (user_id, hosts, next_at) VALUES (?, ?, ?)
             ON CONFLICT (user_id) DO UPDATE SET hosts = excluded.hosts
-        """, (user_id, json.dumps(hosts, separators=(",", ":")), int(time.time()) + INTERVAL))
+        """, (user_id, json.dumps(hosts, separators=(",", ":")), int(time.time()) + interval(db, user_id)))
 
 
 def due(db):
@@ -58,7 +86,8 @@ def due(db):
 
 def move_due(db, user_id, old_due, *, retry=False):
     now = int(time.time())
-    next_at = now + RETRY_INTERVAL if retry else old_due + ((max(0, now - old_due) // INTERVAL) + 1) * INTERVAL
+    period = interval(db, user_id)
+    next_at = now + RETRY_INTERVAL if retry else old_due + ((max(0, now - old_due) // period) + 1) * period
     with db:
         db.execute(
             "UPDATE host_monitors SET next_at = ? WHERE user_id = ? AND next_at = ?", (next_at, user_id, old_due),

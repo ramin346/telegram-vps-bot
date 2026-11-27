@@ -4,6 +4,7 @@ import os
 
 import dns_rotation
 import host_monitor
+import replacement
 
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
@@ -29,6 +30,12 @@ TABLES = {
     "vultr_accounts": (("user_id", "i"), ("token", "s")),
     "cherry_accounts": (("user_id", "i"), ("token", "s")),
     "host_monitors": (("user_id", "i"), ("hosts", "t"), ("next_at", "i")),
+    "host_monitor_settings": (("user_id", "i"), ("interval", "i")),
+    "node_replacements": (
+        ("id", "i"), ("user_id", "i"), ("rotation_id", "i"), ("target", "t"), ("provider", "t"),
+        ("account_id", "i?"), ("project_id", "i?"), ("recipe", "s?"), ("old_id", "t?"),
+        ("state", "t"), ("next_at", "i"), ("remote_id", "t?"), ("deadline", "i"), ("evidence", "n"), ("note", "t"),
+    ),
     "dns_rotations": (("id", "i"), ("user_id", "i"), ("zone_id", "t"), ("record_id", "t"),
                       ("name", "t"), ("kind", "t"), ("expected", "t"), ("steps", "t"),
                       ("due_at", "i"), ("attempts", "n"), ("status", "t"), ("note", "t"), ("account_id", "i?")),
@@ -80,7 +87,7 @@ def restore_file(data, password, storage_cipher):
     try:
         payload = password_cipher(password, data[len(MAGIC):end]).decrypt(data[end:])
         contents = json.loads(payload)
-        optional = {"cherry_accounts", "cloud_saved_names", "cloud_saved_pending", "dns_rotations", "vultr_accounts", "server_folders", "server_folder_members", "host_monitors", "cloudflare_profiles"}
+        optional = {"node_replacements", "host_monitor_settings", "cherry_accounts", "cloud_saved_names", "cloud_saved_pending", "dns_rotations", "vultr_accounts", "server_folders", "server_folder_members", "host_monitors", "cloudflare_profiles"}
         if not isinstance(contents, dict) or not TABLES.keys() - optional <= contents.keys() <= TABLES.keys():
             raise ValueError
         rotations = contents.get("dns_rotations", [])
@@ -115,6 +122,17 @@ def restore_file(data, password, storage_cipher):
             if rotation.account_id is not None and profiles.get(rotation.account_id) != rotation.user_id:
                 raise ValueError
             dns_rotation.read_steps(rotation)
+        for _, seconds in rows["host_monitor_settings"]:
+            if not host_monitor.MIN_INTERVAL <= seconds <= host_monitor.MAX_INTERVAL:
+                raise ValueError
+        for fields in rows["node_replacements"]:
+            rule = replacement.Rule(*fields)
+            if rule.provider not in replacement.PROVIDERS or rule.state not in replacement.TERMINAL | {"watching", "creating", "provisioning", "installing", "deleting"}:
+                raise ValueError
+            if rule.state in {"watching", "provisioning"} and not rule.recipe:
+                raise ValueError
+            if rule.state == "provisioning" and not rule.remote_id:
+                raise ValueError
         return rows
     except (InvalidToken, ValueError, RecursionError):
         raise BackupError("Invalid backup or password") from None

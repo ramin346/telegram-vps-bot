@@ -2,7 +2,9 @@ import asyncio
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from html import escape
+from io import StringIO
 from ipaddress import IPv6Address
+import json
 import logging
 import os
 from pathlib import Path
@@ -13,9 +15,11 @@ import sqlite3
 import subprocess
 import tempfile
 import time
+from types import SimpleNamespace
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
+import httpx
 import paramiko
 from cryptography.fernet import Fernet, InvalidToken
 from telegram import (
@@ -37,6 +41,7 @@ import host_monitor
 import kamatera
 import linode
 import navigation
+import replacement
 import vultr
 
 ROOT = Path(__file__).resolve().parent
@@ -94,7 +99,7 @@ def save_host_keys(host_keys, path):
 
 
 
-def connect(host, port, username, password=None):
+def connect(host, port, username, password=None, pkey=None):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     path = Path.home() / ".ssh" / "telegram-vps-known-hosts"
@@ -105,8 +110,8 @@ def connect(host, port, username, password=None):
             host_keys.load(str(path))
         known_count = len(host_keys)
         client.connect(
-            host, port=port, username=username, password=password,
-            key_filename=os.getenv("SSH_KEY_PATH") if password is None else None,
+            host, port=port, username=username, password=password, pkey=pkey,
+            key_filename=os.getenv("SSH_KEY_PATH") if password is None and pkey is None else None,
             look_for_keys=False, allow_agent=False, timeout=15,
             banner_timeout=15, auth_timeout=15,
         )
@@ -256,6 +261,7 @@ def init_servers(db):
     with db:
         db.execute("CREATE TABLE IF NOT EXISTS cherry_accounts (user_id INTEGER PRIMARY KEY, token BLOB NOT NULL)")
     cloud_saved.init(db)
+    replacement.init(db)
     dns_rotation.init(db)
     host_monitor.init(db)
     has_saved_secrets = db.execute("""
@@ -267,7 +273,8 @@ def init_servers(db):
         UNION ALL SELECT 1 FROM cloudflare_profiles
         UNION ALL SELECT 1 FROM vultr_accounts
         UNION ALL SELECT 1 FROM cherry_accounts
-        UNION ALL SELECT 1 FROM cloud_saved_pending WHERE secret IS NOT NULL LIMIT 1
+        UNION ALL SELECT 1 FROM cloud_saved_pending WHERE secret IS NOT NULL
+        UNION ALL SELECT 1 FROM node_replacements WHERE recipe IS NOT NULL LIMIT 1
     """).fetchone()
     if not key_path.exists() and not has_saved_secrets:
         try:
@@ -1055,12 +1062,15 @@ async def kamatera_button(update, context):
             await message.reply_text("این تأیید قدیمی است. از منوی کاماترا دوباره شروع کن.")
             return
         form = draft["form"]
-        clear(context)
         try:
             token = await kamatera_token(user_id)
         except (kamatera.APIError, InvalidToken):
             await message.reply_text("ورود به API ناموفق بود. کلید کاماترا را بررسی کن.")
             return
+        if await offer_replacement(message, context, user_id, "kamatera", form, token, image=draft["image"]):
+            draft.pop("confirmation", None)
+            return
+        clear(context)
         try:
             command_id = await kamatera.create_server(token, form)
         except kamatera.APIError as exc:
@@ -1087,7 +1097,10 @@ async def kamatera_button(update, context):
         )
         return
 
-    clear(context)
+    if action == "km:new":
+        clear_for_creation(context, "kamatera")
+    else:
+        clear(context)
     if action == "kamatera":
         await message.reply_text("مدیریت کاماترا", reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("ثبت یا تعویض کلید API", callback_data="km:key")],
@@ -1504,7 +1517,7 @@ async def kamatera_text(update, context):
             f"CPU: {form['cpu']} | RAM: {form['ram']} MB | Disk: {form['disk_size_0']} GB\n"
             "یک VPS با IP عمومی و تعرفهٔ ساعتی ساخته می‌شود. هزینه طبق تعرفهٔ حسابت در کاماترا محاسبه می‌شود.",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("تأیید ساخت و هزینه", callback_data=confirmation)],
+                [InlineKeyboardButton(replacement_confirm_label(context), callback_data=confirmation)],
                 [InlineKeyboardButton("لغو", callback_data="cancel")],
             ]),
         )
@@ -1593,7 +1606,10 @@ async def linode_button(update, context):
             await query.answer("این منو بسته شده است.")
             return
     else:
-        clear(context)
+        if action == "li:new":
+            clear_for_creation(context, "linode")
+        else:
+            clear(context)
         state = {}
     await query.answer()
     if action == "linode":
@@ -1667,7 +1683,9 @@ async def linode_button(update, context):
         step = state["step"]
         state.pop("nonce", None)
         if step == "create_confirm":
-            form = state.pop("form")
+            form = state["form"]
+            if await offer_replacement(message, context, user_id, "linode", form, token, image=state["image_label"]):
+                return
             clear(context)
             result = await linode.create(token, form)
             storage = store_created_server(
@@ -1788,7 +1806,7 @@ async def linode_text(update, context):
             f"سرور: {form['label']}\nمنطقه: {form['region']}\nایمیج: {state['image_label']}\n"
             f"پلن: {state['plan'].get('label') or form['type']}\n"
             f"قیمت اعلام‌شده: ${price['hourly']:g}/ساعت، ${price['monthly']:g}/ماه (USD)",
-            reply_markup=linode_keyboard(state, [[("تأیید ساخت و هزینه", "confirm")]]),
+            reply_markup=linode_keyboard(state, [[(replacement_confirm_label(context), "confirm")]]),
         )
     else:
         await message.reply_text("از دکمه‌های همین مرحله استفاده کن یا /cancel را بزن.")
@@ -1871,7 +1889,10 @@ async def hetzner_button(update, context):
             await query.answer("این منو بسته شده است.")
             return
     else:
-        clear(context)
+        if action == "hetzner":
+            clear_for_creation(context, "hetzner")
+        else:
+            clear(context)
         state = {}
     await query.answer()
     message = query.message
@@ -2013,6 +2034,8 @@ async def hetzner_confirm(message, context, state, token, user_id):
     account = {key: state[key] for key in ("account_id", "account_name")}
     if state["step"] == "create_confirm":
         form = state["form"]
+        if await offer_replacement(message, context, user_id, "hetzner", form, token, account=state["account_id"], image=state["image"]):
+            return
         clear(context)
         result = await hetzner.create(token, form)
         instance_id = result["server"]["id"]
@@ -2148,7 +2171,7 @@ async def hetzner_text(update, context):
             f"ایمیج: {state['image']}\nورود: {state['ssh_label']}\n"
             f"قیمت پلن با مالیات: €{hourly}/ساعت، €{monthly}/ماه\n"
             "IPv4 عمومی فعال است و جداگانه طبق تعرفهٔ هتزنر حساب می‌شود.",
-            reply_markup=hetzner_keyboard(state, [[("تأیید ساخت و هزینه", "confirm")]]),
+            reply_markup=hetzner_keyboard(state, [[(replacement_confirm_label(context), "confirm")]]),
         )
     else:
         await message.reply_text("از دکمه‌های همین مرحله استفاده کن یا /cancel را بزن.")
@@ -2196,6 +2219,8 @@ async def cf_rotation_details(message, state, user_id, rotation_id):
         date = datetime.fromtimestamp(row.due_at, ZoneInfo("Asia/Tehran")).strftime("%Y-%m-%d %H:%M:%S")
         text += f"\nIP مرحلهٔ بعد: {steps[0][1]}\nزمان اجرای بعدی: {date} به وقت تهران"
         rows.insert(0, [("⚡ الان عوض کن", "rot_now"), ("🛑 لغو برنامه", "rot_cancel")])
+    if row.status in {"active", "done"}:
+        rows.append([("🔁 جایگزینی خودکار نود", "rot_replace")])
     rows.append([("🗑 حذف برنامه", "rot_delete")])
     if row.note:
         text += "\n" + row.note
@@ -2267,9 +2292,19 @@ async def cf_rotation_review(message, state, page=0):
     )
 
 
-async def cf_rotation_button(message, state, token, user_id, action):
+async def cf_rotation_button(message, state, token, user_id, action, context):
     if action == "rot_list":
         await cf_rotation_list(message, state, user_id)
+    elif action == "rot_replace":
+        row = dns_rotation.get(ADMIN_DB, user_id, state["rotation_id"])
+        if not row or (row.zone_id, row.account_id) != (state["zone"]["id"], state["account_id"]):
+            return
+        targets = list(dict.fromkeys([row.expected, *(ip for _, ip in dns_rotation.read_steps(row))]))
+        clear(context)
+        draft = context.user_data["replacement"] = {
+            "mode": "targets", "rotation_id": row.id, "choices": [(ip, ip) for ip in targets],
+        }
+        await show_cloud_picker(message, draft, 0, "IP مورد پایش را انتخاب کن.", "rp", "منوی Cloudflare", "cloudflare")
     elif action == "rot_refresh":
         await cf_rotation_details(message, state, user_id, state["rotation_id"])
     elif action == "rot_now":
@@ -2635,7 +2670,7 @@ async def cloudflare_button(update, context):
             async with ROTATION_LOCK:
                 await cf_commit(message, state, token)
         elif action == "rotate" or action.startswith("rot_"):
-            await cf_rotation_button(message, state, token, update.effective_user.id, action)
+            await cf_rotation_button(message, state, token, update.effective_user.id, action, context)
     except cloudflare.APIError as exc:
         await cf_error(message, state, exc, action in {"confirm", "rot_confirm"})
 
@@ -2926,7 +2961,10 @@ async def vultr_button(update, context):
             await query.answer("این منو بسته شده است.")
             return
     else:
-        clear(context)
+        if action == "vu:new":
+            clear_for_creation(context, "vultr")
+        else:
+            clear(context)
         state = {}
         context.user_data["vultr"] = state
     await query.answer()
@@ -3031,6 +3069,8 @@ async def vultr_confirm(message, context, state, token, user_id):
     state.pop("nonce", None)
     if state["step"] == "create_confirm":
         form = state["form"]
+        if await offer_replacement(message, context, user_id, "vultr", form, token, image=state["image"]):
+            return
         clear(context)
         instance = await vultr.create(token, form)
         storage = store_created_server(
@@ -3109,7 +3149,7 @@ async def vultr_text(update, context):
             f"نام: {value}\nمنطقه: {form['region']}\nسیستم‌عامل: {state['image']}\n"
             f"پلن: {form['plan']}\nقیمت اعلام‌شدهٔ پلن: ${state['price']:g} در ماه (USD)\n"
             f"شبکه: {'فقط IPv6' if form['plan'].endswith('-v6') else 'IPv4 عمومی'}",
-            reply_markup=vultr_keyboard(state, [[("✅ تأیید ساخت و هزینه", "confirm")],
+            reply_markup=vultr_keyboard(state, [[(replacement_confirm_label(context), "confirm")],
                                                   [("انصراف", "list")]]),
         )
     else:
@@ -3129,7 +3169,7 @@ async def host_check_button(update, context):
         await query.message.reply_text("پینگ و اطلاعات IP", reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🇮🇷 پینگ از ایران", callback_data="hc:ping"),
              InlineKeyboardButton("ℹ️ اطلاعات IP", callback_data="hc:info")],
-            [InlineKeyboardButton("🕒 پایش سه‌ساعته", callback_data="hc:monitor")],
+            [InlineKeyboardButton("🕒 پایش دوره‌ای", callback_data="hc:monitor")],
             [InlineKeyboardButton("بازگشت", callback_data="cancel")],
         ]))
         return
@@ -3203,7 +3243,7 @@ async def host_monitor_menu(message, state, user_id, page=0):
     hosts, next_at = host_monitor.get(ADMIN_DB, user_id)
     state.update(step="list", hosts=hosts)
     offset = page * 8
-    rows = [[("➕ افزودن ساب‌دامنه", "add"), ("⚡ تست درجا", "test")]]
+    rows = [[("➕ افزودن ساب‌دامنه", "add"), ("⚡ تست درجا", "test")], [("⏱ فاصلهٔ پایش", "interval")]]
     rows.extend([(f"🗑 {host[:60]}", f"remove:{index}")] for index, host in enumerate(hosts[offset:offset + 8], offset))
     nav = []
     if page:
@@ -3213,14 +3253,16 @@ async def host_monitor_menu(message, state, user_id, page=0):
     if nav:
         rows.append(nav)
     keyboard = nonce_keyboard(state, rows, "hm")
-    text = f"پایش از ایران هر سه ساعت · {len(hosts)} مقصد"
+    text = f"پایش از ایران هر {host_monitor.interval(ADMIN_DB, user_id) / 3600:g} ساعت · {len(hosts)} مقصد"
     if next_at:
         date = datetime.fromtimestamp(next_at, ZoneInfo("Asia/Tehran"))
         text += f"\nبررسی بعدی: {date:%Y-%m-%d %H:%M} به وقت تهران"
     if hosts:
         text += "\nبرای حذف یک مقصد، دکمهٔ 🗑 کنار نام آن را بزن."
     await message.reply_text(text, reply_markup=InlineKeyboardMarkup([
-        *keyboard.inline_keyboard, [InlineKeyboardButton("بازگشت", callback_data="host_checks")],
+        *keyboard.inline_keyboard,
+        [InlineKeyboardButton("🔁 برنامه‌های جایگزینی نود", callback_data="replacement_list")],
+        [InlineKeyboardButton("بازگشت", callback_data="host_checks")],
     ]))
 
 
@@ -3247,6 +3289,10 @@ async def host_monitor_button(update, context):
         state.pop("nonce", None)
         state["step"] = "add"
         await message.reply_text("ساب‌دامنه‌ها را یک‌به‌یک در خط‌های جداگانه بفرست. برای لغو /cancel را بزن.")
+    elif action == "interval":
+        state.pop("nonce", None)
+        state["step"] = "interval"
+        await message.reply_text("فاصلهٔ پایش را به ساعت بفرست، مثلاً ۱.۵. حداقل ۰.۲۵ و حداکثر ۷۲۰ ساعت.")
     elif action == "test":
         hosts, _ = host_monitor.get(ADMIN_DB, user_id)
         if not hosts:
@@ -3273,6 +3319,18 @@ async def host_monitor_button(update, context):
 async def host_monitor_text(update, context):
     state = context.user_data["host_monitor"]
     message = update.message
+    if state.get("step") == "interval":
+        try:
+            value = message.text.strip().replace("٫", ".")
+            if not re.fullmatch(r"\d{1,3}(?:\.\d{1,4})?", value):
+                raise ValueError
+            seconds = int(Decimal(value) * 3600)
+            host_monitor.set_interval(ADMIN_DB, update.effective_user.id, seconds)
+        except (ValueError, InvalidOperation):
+            await message.reply_text("یک عدد بین ۰.۲۵ و ۷۲۰ ساعت بفرست.")
+            return
+        await host_monitor_menu(message, state, update.effective_user.id)
+        return
     if state.get("step") != "add":
         await message.reply_text("برای مدیریت پایش از دکمه‌ها استفاده کن.")
         return
@@ -3308,7 +3366,7 @@ async def run_host_monitor(bot, user_id, hosts, due_at=None):
         current, current_due = host_monitor.get(ADMIN_DB, user_id)
         if current != hosts or (due_at is not None and current_due != due_at):
             return
-        title = "📡 گزارش پایش سه‌ساعته" if due_at is not None else "⚡ نتیجهٔ تست درجا"
+        title = "📡 گزارش پایش دوره‌ای" if due_at is not None else "⚡ نتیجهٔ تست درجا"
         await send_monitor_report(bot, user_id, f"{title}\n\n{host_monitor.report(result)}")
         if due_at is not None:
             host_monitor.move_due(ADMIN_DB, user_id, due_at)
@@ -3412,7 +3470,10 @@ async def cherry_button(update, context):
             await query.answer("این منو بسته شده است.")
             return
     else:
-        clear(context)
+        if action == "ch:new":
+            clear_for_creation(context, "cherry")
+        else:
+            clear(context)
         state = context.user_data["cherry"] = {}
     await query.answer()
     if action == "cherry":
@@ -3462,7 +3523,7 @@ async def cherry_button(update, context):
                 text += "\nسرور و داده‌های روی دیسک آن برای همیشه حذف می‌شوند."
             await message.reply_text(text, reply_markup=cherry_keyboard(state, [[("تأیید", "confirm"), ("انصراف", "refresh")]]))
         elif action == "confirm":
-            await cherry_confirm(message, state, token, user_id)
+            await cherry_confirm(message, context, state, token, user_id)
     except cherry.APIError as exc:
         text = "درخواست Cherry Servers ناموفق بود."
         if action == "confirm" and (exc.status is None or exc.status >= 500):
@@ -3532,10 +3593,12 @@ async def cherry_pick(message, state, token, index):
     await cherry_picker(message, state)
 
 
-async def cherry_confirm(message, state, token, user_id):
+async def cherry_confirm(message, context, state, token, user_id):
     state.pop("nonce", None)
     if state["step"] == "create_confirm":
         form = state["form"]
+        if await offer_replacement(message, context, user_id, "cherry", form, token, project=state["project"], image=state["image_label"]):
+            return
         server = await cherry.create(token, state["project"], form)
         storage = store_created_server(
             user_id, "cherry", server["id"], form["region"], form["hostname"], instance=server,
@@ -3592,10 +3655,503 @@ async def cherry_text(update, context):
         await message.reply_text(
             f"نام: {value}\nپروژه: {state['project_name']}\nدیتاسنتر: {form['region']}\n"
             f"سیستم‌عامل: {state['image_label']}\nپلن: {state['plan_label']}\nقیمت پلن: {state['price_label']}",
-            reply_markup=cherry_keyboard(state, [[("✅ تأیید ساخت و هزینه", "confirm")]]),
+            reply_markup=cherry_keyboard(state, [[(replacement_confirm_label(context), "confirm")]]),
         )
     else:
         await message.reply_text("از دکمه‌های همین مرحله استفاده کن یا /cancel را بزن.")
+
+
+def replacement_confirm_label(context):
+    if context.user_data.get("replacement", {}).get("provider"):
+        return "ادامهٔ تنظیم جایگزینی"
+    return "تأیید ساخت و هزینه"
+
+
+REPLACEMENT_CHECKS = set()
+REPLACEMENT_ERRORS = (
+    kamatera.APIError, linode.APIError, hetzner.APIError, vultr.APIError, cherry.APIError,
+    cloudflare.APIError, InvalidToken,
+)
+REPLACEMENT_START = {
+    "hetzner": "hetzner", "linode": "li:new", "kamatera": "km:new", "vultr": "vu:new", "cherry": "ch:new",
+}
+REPLACEMENT_STATUS = {
+    "watching": "منتظر پایش", "creating": "در حال ثبت ساخت", "provisioning": "در انتظار VPS",
+    "installing": "در حال نصب نود", "deleting": "در حال درخواست حذف", "done": "انجام شد",
+    "failed": "متوقف با خطا", "cancelled": "لغوشده",
+}
+
+
+def clear_for_creation(context, provider):
+    draft = context.user_data.get("replacement")
+    clear(context)
+    if draft and draft.get("provider") == provider:
+        context.user_data["replacement"] = draft
+
+
+async def replacement_token(rule):
+    if rule.provider == "kamatera":
+        return await kamatera_token(rule.user_id)
+    if rule.provider == "hetzner":
+        return hetzner_token(rule.user_id, rule.account_id)
+    return {"linode": linode_token, "vultr": vultr_token, "cherry": cherry_token}[rule.provider](rule.user_id)
+
+
+async def replacement_servers(rule, token):
+    if rule.provider == "hetzner":
+        return await hetzner.catalog(token, "servers")
+    if rule.provider == "kamatera":
+        return await kamatera.list_servers(token)
+    if rule.provider == "linode":
+        return await linode.catalog("/linode/instances", token)
+    if rule.provider == "vultr":
+        return await vultr.catalog("/instances", "instances", token)
+    return await cherry.catalog(f"/projects/{rule.project_id}/servers", token)
+
+
+async def replacement_details(rule, token, remote_id):
+    if rule.provider in {"linode", "hetzner", "cherry"}:
+        remote_id = int(remote_id)
+    if rule.provider == "hetzner":
+        return await hetzner.server_details(token, remote_id)
+    if rule.provider == "kamatera":
+        return await kamatera.server_details(token, remote_id)
+    return await {"linode": linode.details, "vultr": vultr.details, "cherry": cherry.details}[rule.provider](token, remote_id)
+
+
+def replacement_region(provider, row):
+    value = row.get("datacenter") if provider == "kamatera" else row.get("region")
+    if provider == "hetzner":
+        value = row.get("location") or (row.get("datacenter") or {}).get("location")
+    if isinstance(value, dict):
+        return value.get("slug") or value.get("name")
+    return value
+
+
+def replacement_ips(provider, row):
+    if provider == "linode":
+        values = [*(row.get("ipv4") or []), row.get("ipv6")]
+    elif provider == "hetzner":
+        net = row.get("public_net") or {}
+        values = [(net.get(key) or {}).get("ip") for key in ("ipv4", "ipv6")]
+    elif provider == "kamatera":
+        values = [ip for entry in row.get("networks") or [] for ip in entry.get("ips") or []]
+    elif provider == "cherry":
+        values = [entry.get("address") for entry in row.get("ip_addresses") or []]
+    else:
+        values = [row.get("main_ip"), row.get("v6_main_ip")]
+    return {address for value in values if (address := cloud_saved.public_address([value]))}
+
+
+async def replacement_find_old(rule, token, region):
+    candidates = []
+    for row in await replacement_servers(rule, token):
+        if str(replacement_region(rule.provider, row)).casefold() != region.casefold():
+            continue
+        if rule.provider == "kamatera":
+            row = await replacement_details(rule, token, row["id"])
+        if rule.target in replacement_ips(rule.provider, row):
+            candidates.append(str(row["id"]))
+    return candidates[0] if len(candidates) == 1 else None
+
+
+async def offer_replacement(message, context, user_id, provider, form, token, *, account=None, project=None, image=""):
+    draft = context.user_data.get("replacement")
+    if not draft or draft.get("provider") != provider:
+        return False
+    if "windows" in image.casefold() or (provider == "cherry" and "bsd" in image.casefold()):
+        await message.reply_text("برای نصب خودکار نود، یک ایمیج لینوکسی سازگار با نصب‌کنندهٔ پاسارگارد انتخاب کن.")
+        return True
+    region = form[replacement.REGION_KEY.get(provider, "region")]
+    probe = replacement.Rule(0, user_id, draft["rotation_id"], draft["target"], provider,
+                             account, project, None, None, "", 0, None, 0, 0, "")
+    try:
+        old_id = await replacement_find_old(probe, token, region)
+    except REPLACEMENT_ERRORS:
+        old_id = None
+    draft.update(account=account, project=project, form=dict(form), old_id=old_id)
+    rows = [[("سرور قبلی را نگه دار", "keep")]]
+    text = (
+        f"IP مورد پایش: {draft['target']}\nسرویس: {replacement.PROVIDERS[provider]} · دیتاسنتر: {region}\n"
+        "تأیید، یک برنامهٔ یک‌بارمصرف ثبت می‌کند. پس از بی‌پاسخ‌ماندن پینگ و تأیید دوبارهٔ آن، "
+        "حداکثر یک VPS هزینه‌دار ساخته می‌شود و نصب نود شروع می‌شود. رکورد Cloudflare عوض نمی‌شود."
+    )
+    if old_id:
+        rows.append([("بعد از آماده‌شدن نود، حذف کن", "auto")])
+        text += f"\nشناسهٔ سرور قبلی: {old_id}. حذف خودکار می‌تواند DNS را روی IP قدیمی و غیرفعال بگذارد."
+    else:
+        text += "\nسرور قبلی در این حساب و دیتاسنتر به‌صورت یکتا پیدا نشد. حذف آن دستی خواهد بود."
+    await message.reply_text(text, reply_markup=nonce_keyboard(draft, rows, "rp"))
+    return True
+
+
+async def replacement_menu(message, state, user_id, page=0):
+    state.update(mode="list", choices=[
+        (rule_id, f"{target} · {replacement.PROVIDERS.get(provider, provider)} · {REPLACEMENT_STATUS.get(status, status)}")
+        for rule_id, target, provider, status in replacement.for_user(ADMIN_DB, user_id)
+    ])
+    await show_cloud_picker(message, state, page, "برنامه‌های جایگزینی نود", "rp", "پایش IP", "hc:monitor")
+
+
+async def replacement_button(update, context):
+    query = update.callback_query
+    if not private_admin(update):
+        await query.answer()
+        return
+    message = query.message
+    user_id = update.effective_user.id
+    if query.data == "replacement_list":
+        await query.answer()
+        clear(context)
+        await replacement_menu(message, context.user_data.setdefault("replacement", {}), user_id)
+        return
+    draft = context.user_data.get("replacement", {})
+    _, nonce, action = query.data.split(":", 2)
+    if nonce != draft.get("nonce"):
+        await query.answer("این منو بسته شده است.")
+        return
+    await query.answer()
+    if action.startswith("page:"):
+        page = int(action.split(":")[1])
+        if page * 8 < len(draft["choices"]):
+            if draft.get("mode") == "list":
+                await replacement_menu(message, draft, user_id, page)
+            else:
+                await show_cloud_picker(message, draft, page, "IP مورد پایش را انتخاب کن.", "rp", "منوی Cloudflare", "cloudflare")
+        return
+    if action.startswith("pick:"):
+        index = int(action.split(":")[1])
+        if index >= len(draft["choices"]):
+            return
+        value = draft["choices"][index][0]
+        if draft.get("mode") == "list":
+            row = replacement.get(ADMIN_DB, user_id, value)
+            if not row:
+                return
+            draft["rule_id"] = row.id
+            buttons = [[("بازگشت به فهرست", "list")]]
+            if row.state == "watching":
+                buttons.insert(0, [("لغو برنامه", "cancel")])
+            await message.reply_text(
+                f"{row.target} · {replacement.PROVIDERS[row.provider]}\n{REPLACEMENT_STATUS[row.state]}"
+                + (f"\nشناسهٔ VPS جدید: {row.remote_id}" if row.remote_id else "") + (f"\n{row.note}" if row.note else ""),
+                reply_markup=nonce_keyboard(draft, buttons, "rp"),
+            )
+        else:
+            draft["target"] = value
+            await message.reply_text("سرویس ساخت VPS جایگزین را انتخاب کن.", reply_markup=nonce_keyboard(
+                draft, [[(caption, f"provider:{provider}")] for provider, caption in replacement.PROVIDERS.items()], "rp",
+            ))
+        return
+    if action.startswith("provider:"):
+        provider = action.split(":")[1]
+        draft.update(provider=provider)
+        draft.pop("nonce", None)
+        await message.reply_text(
+            "مشخصات VPS جایگزین را انتخاب کن. در این مسیر دکمهٔ تأیید فقط برنامه را ثبت می‌کند.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("انتخاب مشخصات", callback_data=REPLACEMENT_START[provider])]]),
+        )
+    elif action == "list":
+        await replacement_menu(message, draft, user_id)
+    elif action == "cancel":
+        row = replacement.get(ADMIN_DB, user_id, draft["rule_id"])
+        if row and row.state == "watching":
+            replacement.update(ADMIN_DB, row, state="cancelled", recipe=None)
+        await replacement_menu(message, draft, user_id)
+    elif action in {"keep", "auto"}:
+        if action == "auto" and not draft.get("old_id"):
+            return
+        row = dns_rotation.get(ADMIN_DB, user_id, draft["rotation_id"])
+        if not row or row.status not in {"active", "done"}:
+            await message.reply_text("برنامهٔ تعویض IP دیگر فعال یا قابل استفاده نیست.")
+            return
+        if draft["target"] != row.expected and (
+            row.status != "active" or all(ip != draft["target"] for _, ip in dns_rotation.read_steps(row))
+        ):
+            await message.reply_text("این IP دیگر در برنامه نیست. دوباره از برنامهٔ تعویض IP انتخاب کن.")
+            return
+        secret = SERVER_CIPHER.encrypt(json.dumps(draft["form"]).encode())
+        try:
+            replacement.add(
+                ADMIN_DB, user_id, row.id, draft["target"], draft["provider"], draft["account"], draft["project"],
+                secret, draft["old_id"] if action == "auto" else None, host_monitor.interval(ADMIN_DB, user_id),
+            )
+        except sqlite3.IntegrityError:
+            await message.reply_text("برای این IP در این برنامه از قبل یک جایگزینی ثبت شده است.")
+            return
+        clear(context)
+        await message.reply_text("برنامهٔ جایگزینی ثبت شد.", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("برنامه‌های جایگزینی", callback_data="replacement_list")],
+        ]))
+
+
+def replacement_private_key(recipe):
+    return paramiko.RSAKey.from_private_key(StringIO(recipe["_ssh_key"]))
+
+
+def prepare_replacement(rule, recipe):
+    form = {key: value for key, value in recipe.items() if not key.startswith("_")}
+    name_key = replacement.NAME_KEY.get(rule.provider, "label")
+    suffix = f"-r{rule.id}-{secrets.token_hex(3)}"
+    form[name_key] = form[name_key][:63 - len(suffix)].rstrip("-_.") + suffix
+    if rule.provider == "vultr":
+        form["hostname"] = form[name_key]
+    if rule.provider == "hetzner":
+        key = paramiko.RSAKey.generate(2048)
+        raw = StringIO()
+        key.write_private_key(raw)
+        recipe["_ssh_key"] = raw.getvalue()
+        marker = f"telegram-vps-replacement-{rule.id}"
+        form["user_data"] = (
+            "#!/bin/sh\nset -e\ninstall -d -m 700 /root/.ssh\n"
+            f"printf '%s\\n' 'ssh-rsa {key.get_base64()} {marker}' >> /root/.ssh/authorized_keys\n"
+            "chmod 600 /root/.ssh/authorized_keys\n"
+        )
+    return form
+
+
+async def create_replacement(rule, token, form):
+    if rule.provider == "kamatera":
+        return await kamatera.create_server(token, form), None
+    if rule.provider == "hetzner":
+        result = await hetzner.create(token, form)
+        return str(result["server"]["id"]), result.get("root_password")
+    if rule.provider == "cherry":
+        result = await cherry.create(token, rule.project_id, form)
+        return str(result["id"]), result.get("password")
+    create = linode.create if rule.provider == "linode" else vultr.create
+    result = await create(token, form)
+    return str(result["id"]), result.get("default_password")
+
+
+async def delete_replacement_origin(rule, token):
+    if rule.provider == "hetzner":
+        await hetzner.change_server(token, int(rule.old_id), "delete")
+    elif rule.provider == "linode":
+        await linode.delete_instance(token, int(rule.old_id))
+    elif rule.provider == "kamatera":
+        await kamatera.terminate_server(token, rule.old_id)
+    elif rule.provider == "vultr":
+        await vultr.change_instance(token, rule.old_id, "delete")
+    else:
+        await cherry.change_server(token, int(rule.old_id), "delete")
+
+
+async def replacement_active(rule):
+    rotation = dns_rotation.get(ADMIN_DB, rule.user_id, rule.rotation_id)
+    if not rotation or rotation.status not in {"active", "done"}:
+        return False, False
+    if rotation.expected != rule.target:
+        upcoming = rotation.status == "active" and any(step[1] == rule.target for step in dns_rotation.read_steps(rotation))
+        return False, upcoming
+    token = cf_token(rule.user_id, rotation.account_id)
+    if not token:
+        return False, True
+    record = await cloudflare.record(token, rotation.zone_id, rotation.record_id)
+    active = (
+        record.get("name") == rotation.name and record.get("type") == rotation.kind
+        and cloudflare.destination(record.get("content") or "", rotation.kind) == rule.target
+    )
+    return active, True
+
+
+async def replacement_notify(bot, rule, text):
+    if user_has_access(rule.user_id):
+        try:
+            await bot.send_message(chat_id=rule.user_id, text=f"🔁 جایگزینی {rule.target}\n{text}")
+        except TelegramError:
+            pass
+
+
+async def replacement_fail(bot, rule, text):
+    if replacement.update(ADMIN_DB, rule, state="failed", note=text, recipe=None):
+        await replacement_notify(bot, rule, text)
+
+
+async def replacement_watch(bot, rule, recipe, now):
+    delay = host_monitor.interval(ADMIN_DB, rule.user_id)
+    try:
+        active, upcoming = await replacement_active(rule)
+        if not upcoming:
+            replacement.update(ADMIN_DB, rule, state="cancelled", recipe=None, note="این IP دیگر در برنامه نیست.")
+            return
+        if not active:
+            replacement.update(ADMIN_DB, rule, next_at=now + delay, evidence=0)
+            return
+        async with httpx.AsyncClient(timeout=8, follow_redirects=False) as client:
+            networks = await host_monitor.aws_networks(client)
+            status = await host_monitor.check_ip(client, rule.target, networks)
+    except (*REPLACEMENT_ERRORS, ValueError):
+        status = "unknown"
+    if status != "down" or not rule.evidence:
+        replacement.update(
+            ADMIN_DB, rule, evidence=int(status == "down"),
+            next_at=now + (120 if status == "down" else delay),
+        )
+        return
+    try:
+        token = await replacement_token(rule)
+    except REPLACEMENT_ERRORS:
+        token = None
+    if not token:
+        await replacement_fail(bot, rule, "توکن سرویس برای ساخت VPS در دسترس نیست.")
+        return
+    form = await asyncio.to_thread(prepare_replacement, rule, recipe)
+    recipe["_name"] = form[replacement.NAME_KEY.get(rule.provider, "label")]
+    encoded = SERVER_CIPHER.encrypt(json.dumps(recipe).encode())
+    try:
+        still_active, _ = await replacement_active(rule)
+    except (*REPLACEMENT_ERRORS, ValueError):
+        still_active = False
+    if not still_active or not user_has_access(rule.user_id):
+        replacement.update(ADMIN_DB, rule, next_at=now + delay, evidence=0)
+        return
+    claim = replacement.update(ADMIN_DB, rule, state="creating", recipe=encoded, next_at=now + 180)
+    if not claim:
+        return
+    try:
+        remote_id, initial_password = await create_replacement(claim, token, form)
+    except REPLACEMENT_ERRORS:
+        await replacement_fail(bot, claim, "ساخت VPS تأیید نشد. برای جلوگیری از ساخت تکراری، پنل سرویس را بررسی کن.")
+        return
+    if isinstance(initial_password, str) and initial_password:
+        recipe["_initial_password"] = initial_password
+        encoded = SERVER_CIPHER.encrypt(json.dumps(recipe).encode())
+    if replacement.update(ADMIN_DB, claim, state="provisioning", remote_id=remote_id, recipe=encoded,
+                          next_at=int(time.time()) + 30, deadline=int(time.time()) + 3600):
+        await replacement_notify(bot, claim, f"درخواست VPS جایگزین ثبت شد. شناسه: {remote_id}")
+
+
+async def replacement_instance(rule, token, recipe):
+    if rule.provider != "kamatera":
+        return await replacement_details(rule, token, rule.remote_id)
+    pending = SimpleNamespace(user_id=rule.user_id, remote_id=rule.remote_id,
+                              region=recipe["datacenter"], name=recipe["_name"])
+    instance, failed = await kamatera_created_instance(pending)
+    if failed:
+        raise kamatera.APIError(409)
+    return instance
+
+
+async def replacement_install(bot, rule, recipe, now):
+    if now >= rule.deadline:
+        await replacement_fail(bot, rule, "VPS یا دسترسی SSH در مهلت بررسی آماده نشد. سرور قبلی حفظ شد.")
+        return
+    client = None
+    try:
+        token = await replacement_token(rule)
+        instance = await replacement_instance(rule, token, recipe) if token else None
+        ip = cloud_saved.instance_address(rule.provider, instance) if instance else None
+        if not ip:
+            replacement.update(ADMIN_DB, rule, next_at=now + replacement.POLL)
+            return
+        password = (recipe.get("root_pass") or recipe.get("password") or recipe.get("_initial_password")
+                    or instance.get("default_password") or instance.get("password"))
+        key = replacement_private_key(recipe) if rule.provider == "hetzner" else None
+        if key or password:
+            client = await asyncio.to_thread(connect, ip, 22, "root", None if key else password, key)
+    except (OSError, ValueError, paramiko.SSHException, *REPLACEMENT_ERRORS):
+        pass
+    if client is None:
+        replacement.update(ADMIN_DB, rule, next_at=now + replacement.POLL)
+        return
+    claim = None
+    try:
+        if user_has_access(rule.user_id):
+            claim = replacement.update(ADMIN_DB, rule, state="installing", next_at=now + 1900)
+        if not claim:
+            return
+        status, node = await asyncio.to_thread(install_node, client, "")
+        if status or not node or not all(node):
+            await replacement_fail(bot, claim, "نصب یا استخراج اطلاعات نود ناموفق بود. سرور قبلی حفظ شد.")
+            return
+        if key:
+            marker = f"telegram-vps-replacement-{rule.id}"
+            cleanup, _ = await asyncio.to_thread(run, client, f"sed -i '/ {marker}$/d' /root/.ssh/authorized_keys")
+            if cleanup:
+                await replacement_fail(bot, claim, "نود نصب شد، اما پاک‌کردن کلید موقت SSH تأیید نشد. سرور قبلی حفظ شد.")
+                return
+    except (OSError, paramiko.SSHException):
+        if claim:
+            await replacement_fail(bot, claim, "ارتباط در زمان نصب یا آماده‌سازی نود قطع شد. سرور قبلی حفظ شد.")
+        return
+    finally:
+        client.close()
+    if not user_has_access(rule.user_id) or replacement.get(ADMIN_DB, claim.user_id, claim.id) != claim:
+        return
+    region = recipe[replacement.REGION_KEY.get(rule.provider, "region")]
+    store_created_server(
+        rule.user_id, rule.provider, rule.remote_id, region, recipe["_name"], instance=instance,
+        password=password, account_id=rule.account_id,
+    )
+    try:
+        await bot.send_message(chat_id=rule.user_id, text=f"✅ نود جایگزین آماده شد.\nIP: {ip}\nAPI Key: {node[0]}")
+        await bot.send_message(chat_id=rule.user_id, text=node[1])
+    except TelegramError:
+        await replacement_fail(bot, claim, "نود نصب شد، اما ارسال اطلاعات نود تأیید نشد. سرور قبلی حفظ شد.")
+        return
+    if not rule.old_id:
+        replacement.update(ADMIN_DB, claim, state="done", recipe=None, note=f"نود جایگزین: {ip} · سرور قبلی حفظ شد.")
+        return
+    try:
+        nodes, results = await host_checks.ping_iran(ip)
+        old = await replacement_details(rule, token, rule.old_id)
+        active, _ = await replacement_active(rule)
+    except (host_checks.CheckError, *REPLACEMENT_ERRORS, ValueError):
+        nodes, results, old, active = {}, {}, {}, False
+    if (
+        not user_has_access(rule.user_id) or not active or host_monitor.ping_status(nodes, results) != "ok"
+        or rule.target not in replacement_ips(rule.provider, old)
+        or str(replacement_region(rule.provider, old)).casefold() != region.casefold()
+        or str(instance.get("id")) == rule.old_id
+    ):
+        replacement.update(ADMIN_DB, claim, state="done", recipe=None, note=f"نود جایگزین: {ip} · حذف خودکار تأیید نشد.")
+        await replacement_notify(bot, claim, "شرایط حذف خودکار تأیید نشد. سرور قبلی حفظ شد.")
+        return
+    deleting = replacement.update(ADMIN_DB, claim, state="deleting", recipe=None, next_at=int(time.time()) + 180)
+    if not deleting:
+        return
+    try:
+        await delete_replacement_origin(deleting, token)
+    except REPLACEMENT_ERRORS:
+        await replacement_fail(bot, deleting, "نتیجهٔ درخواست حذف مشخص نیست. وضعیت VPS قبلی را در پنل بررسی کن.")
+        return
+    replacement.update(ADMIN_DB, deleting, state="done", note=f"نود جایگزین: {ip} · درخواست حذف VPS قبلی ثبت شد.")
+    await replacement_notify(bot, deleting, "درخواست حذف VPS قبلی ثبت شد. رکورد Cloudflare تغییر نکرد.")
+
+
+async def run_replacement(bot, rule):
+    if rule.id in REPLACEMENT_CHECKS:
+        return
+    REPLACEMENT_CHECKS.add(rule.id)
+    try:
+        if not user_has_access(rule.user_id):
+            replacement.update(ADMIN_DB, rule, state="cancelled", recipe=None, note="دسترسی کاربر فعال نیست.")
+            return
+        if rule.state not in {"watching", "provisioning"}:
+            await replacement_fail(bot, rule, "اجرای قبلی کامل ثبت نشد. وضعیت VPSها را در پنل بررسی کن.")
+            return
+        recipe = json.loads(SERVER_CIPHER.decrypt(rule.recipe))
+        now = int(time.time())
+        if rule.state == "watching":
+            await replacement_watch(bot, rule, recipe, now)
+        else:
+            await replacement_install(bot, rule, recipe, now)
+    except (TypeError, ValueError, InvalidToken):
+        current = replacement.get(ADMIN_DB, rule.user_id, rule.id)
+        if current and current.state not in replacement.TERMINAL:
+            await replacement_fail(bot, current, "برنامه یا اطلاعات ذخیره‌شده قابل خواندن نبود.")
+    finally:
+        REPLACEMENT_CHECKS.discard(rule.id)
+
+
+async def replacement_job(context):
+    for rule in replacement.due(ADMIN_DB):
+        if rule.id not in REPLACEMENT_CHECKS:
+            task = context.application.create_task(run_replacement(context.bot, rule))
+            # Start the task so it reserves the rule before a subsequent job tick.
+            if not task.done():
+                await asyncio.sleep(0)
 
 
 async def handle_text(update, context):
@@ -3758,7 +4314,11 @@ if __name__ == "__main__":
     add(CommandHandler("update", update_command))
     add(CallbackQueryHandler(cancel, pattern=r"^cancel$"))
     add(CallbackQueryHandler(
-        host_monitor_button, pattern=r"^(?:hc:monitor|hm:[a-f0-9]{16}:(?:add|test|(?:remove|page):[0-9]{1,8}))$",
+        replacement_button,
+        pattern=r"^(?:replacement_list|rp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|provider:(?:hetzner|linode|kamatera|vultr|cherry)|keep|auto|list|cancel))$",
+    ))
+    add(CallbackQueryHandler(
+        host_monitor_button, pattern=r"^(?:hc:monitor|hm:[a-f0-9]{16}:(?:add|test|interval|(?:remove|page):[0-9]{1,8}))$",
     ))
     add(CallbackQueryHandler(
         host_check_button, pattern=r"^(?:host_checks|hc:(?:ping|info))$",
@@ -3777,7 +4337,7 @@ if __name__ == "__main__":
     ))
     add(CallbackQueryHandler(
         cloudflare_button,
-        pattern=r"^(?:cloudflare|cf:(?:key|zones|add)|cp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|accounts|replace|zones|list|edit_list|search|dns|add|type:(?:A|AAAA|CNAME)|field:(?:name|content|proxied|ttl)|proxy:(?:on|off)|ttl:(?:1|60|300|600|1800|3600)|delete|confirm|rotate|rot_(?:next|review|confirm|list|refresh|now|cancel|delete|remove|page:[0-9]{1,8})))$",
+        pattern=r"^(?:cloudflare|cf:(?:key|zones|add)|cp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|accounts|replace|zones|list|edit_list|search|dns|add|type:(?:A|AAAA|CNAME)|field:(?:name|content|proxied|ttl)|proxy:(?:on|off)|ttl:(?:1|60|300|600|1800|3600)|delete|confirm|rotate|rot_(?:next|review|confirm|list|refresh|now|cancel|delete|remove|replace|page:[0-9]{1,8})))$",
     ))
     add(CallbackQueryHandler(
         hetzner_button,
@@ -3810,4 +4370,5 @@ if __name__ == "__main__":
     application.job_queue.run_repeating(dns_rotation_job, interval=15, first=1)
     application.job_queue.run_repeating(host_monitor_job, interval=60, first=5)
     application.job_queue.run_repeating(cloud_saved_job, interval=60, first=10)
+    application.job_queue.run_repeating(replacement_job, interval=30, first=15)
     application.run_polling(drop_pending_updates=True, allowed_updates=["message", "callback_query"])

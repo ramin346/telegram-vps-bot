@@ -14,7 +14,7 @@ MAIN = "nav:main"
 NAV_ROW = (InlineKeyboardButton("⬅️ مرحلهٔ قبل", callback_data=BACK),
            InlineKeyboardButton("🏠 منوی اصلی", callback_data=MAIN))
 NONCE_KEYS = {"nonce", "token", "servers_token", "picker"}
-SENSITIVE_KEYS = {"client", "expiry_job", "password", "root_pass", "client_id", "document", "rows", "confirmation"}
+SENSITIVE_KEYS = {"client", "expiry_job", "password", "root_pass", "_ssh_key", "client_id", "document", "rows", "confirmation"}
 ACTION_NONCE = re.compile(r"(?<=:)[0-9a-f]{12,16}(?=:|$)")
 MAX_DEPTH = 16
 MAX_CHATS = 128
@@ -99,7 +99,7 @@ def safe_keyboard(markup):
         for button in row:
             data = button.callback_data
             if button.copy_text or (isinstance(data, str) and (
-                {"confirm", "make", "apply", "rot_confirm", "rot_remove", "revoke"} & set(data.split(":"))
+                {"confirm", "make", "apply", "rot_confirm", "rot_remove", "revoke", "keep", "auto"} & set(data.split(":"))
             )):
                 return False
     return True
