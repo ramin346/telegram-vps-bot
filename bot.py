@@ -553,6 +553,18 @@ async def my_servers(update, context):
         await show_server_folders(update, context)
 
 
+async def show_saved_password_retry(message, state):
+    token = server_list_token(state)
+    server_id = state["saved_server_id"]
+    await message.reply_text(
+        "اگر رمز SSH عوض شده، رمز جدید را وارد کن تا دوباره اتصال را تست کنم.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔑 وارد کردن رمز جدید", callback_data=f"s:{token}:new_password:{server_id}")],
+            [InlineKeyboardButton("لغو", callback_data="cancel")],
+        ]),
+    )
+
+
 async def server_button(update, context):
     query = update.callback_query
     state = context.user_data
@@ -634,20 +646,25 @@ async def server_button(update, context):
             ]),
         )
         return
+    if verb == "new_password" and state.get("saved_server_id") == server_id:
+        state.pop("servers_token")
+        state["password_only"] = True
+        await ask_password(query.message, owner=False)
+        return
     if verb == "connect" or (verb == "pick" and action):
         state.pop("servers_token")
-        state.update(action=action or "ssh", address=(host, port), username=username)
+        state.update(action=action or "ssh", address=(host, port), username=username, saved_server_id=server_id)
         if secret is None and not (private_owner(update) and os.getenv("SSH_KEY_PATH")):
             await ask_password(query.message, private_owner(update))
             return
         try:
             password = SERVER_CIPHER.decrypt(secret).decode() if secret is not None else None
         except InvalidToken:
-            await query.message.reply_text("رمز ذخیره‌شده خوانده نشد. رمز SSH را دوباره بفرست.")
-            await ask_password(query.message, private_owner(update))
+            await query.message.reply_text("رمز ذخیره‌شده خوانده نشد.")
+            await show_saved_password_retry(query.message, state)
             return
         if not await login_server(update, context, password, remember=False):
-            await ask_password(query.message, private_owner(update))
+            await show_saved_password_retry(query.message, state)
 
 
 async def license_panel(message):
@@ -3347,7 +3364,10 @@ async def handle_text(update, context):
         await ask_password(message, private_owner(update))
         return
     if "client" not in state:
-        use_key = private_owner(update) and message.text == "." and os.getenv("SSH_KEY_PATH")
+        use_key = (
+            not state.get("password_only") and private_owner(update)
+            and message.text == "." and os.getenv("SSH_KEY_PATH")
+        )
         password = None if use_key else message.text
         if password is not None:
             try:
@@ -3355,7 +3375,8 @@ async def handle_text(update, context):
             except TelegramError:
                 await message.reply_text("حذف پیام رمز ناموفق بود. پیام را دستی حذف کن.")
         state.pop("servers_token", None)
-        await login_server(update, context, password)
+        if not await login_server(update, context, password) and "saved_server_id" in state:
+            await show_saved_password_retry(message, state)
         return
     try:
         await operate(message, state, state["client"], message.text)
@@ -3463,7 +3484,7 @@ if __name__ == "__main__":
     application.add_handler(CallbackQueryHandler(my_servers, pattern=r"^my_servers$"))
     application.add_handler(CallbackQueryHandler(
         server_button,
-        pattern=r"^s:[0-9a-f]{12}:(?:pick|page|new|connect|delete|folder_new|folders_page|folder|move|move_page|move_to):[0-9]{1,19}$",
+        pattern=r"^s:[0-9a-f]{12}:(?:pick|page|new|connect|delete|folder_new|folders_page|folder|move|move_page|move_to|new_password):[0-9]{1,19}$",
     ))
     application.add_handler(CallbackQueryHandler(
         license_button,
