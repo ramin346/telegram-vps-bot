@@ -28,6 +28,8 @@ TABLES = {
     "cloudflare_accounts": (("user_id", "i"), ("token", "s")),
     "cloudflare_profiles": (("id", "i"), ("user_id", "i"), ("name", "t"), ("token", "s")),
     "vultr_accounts": (("user_id", "i"), ("token", "s")),
+    "pasarguard_accounts": (("user_id", "i"), ("url", "t"), ("credentials", "s"),
+                           ("core_id", "i?"), ("inbound", "t?"), ("next_number", "i")),
     "cherry_accounts": (("user_id", "i"), ("token", "s")),
     "host_monitors": (("user_id", "i"), ("hosts", "t"), ("next_at", "i")),
     "host_monitor_settings": (("user_id", "i"), ("interval", "i")),
@@ -87,7 +89,7 @@ def restore_file(data, password, storage_cipher):
     try:
         payload = password_cipher(password, data[len(MAGIC):end]).decrypt(data[end:])
         contents = json.loads(payload)
-        optional = {"node_replacements", "host_monitor_settings", "cherry_accounts", "cloud_saved_names", "cloud_saved_pending", "dns_rotations", "vultr_accounts", "server_folders", "server_folder_members", "host_monitors", "cloudflare_profiles"}
+        optional = {"pasarguard_accounts", "node_replacements", "host_monitor_settings", "cherry_accounts", "cloud_saved_names", "cloud_saved_pending", "dns_rotations", "vultr_accounts", "server_folders", "server_folder_members", "host_monitors", "cloudflare_profiles"}
         if not isinstance(contents, dict) or not TABLES.keys() - optional <= contents.keys() <= TABLES.keys():
             raise ValueError
         rotations = contents.get("dns_rotations", [])
@@ -165,6 +167,7 @@ def restore_rows(entries, columns, cipher):
 
 def replace_data(db, rows):
     with db:
+        db.execute("DELETE FROM pasarguard_installs")
         for table in reversed(TABLES):
             db.execute(f"DELETE FROM {table}")
         for table, columns in TABLES.items():

@@ -3,7 +3,7 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from html import escape
 from io import StringIO
-from ipaddress import IPv6Address
+from ipaddress import IPv6Address, ip_address
 import json
 import logging
 import os
@@ -41,6 +41,7 @@ import host_monitor
 import kamatera
 import linode
 import navigation
+import pasarguard
 import replacement
 import vultr
 
@@ -264,6 +265,7 @@ def init_servers(db):
     replacement.init(db)
     dns_rotation.init(db)
     host_monitor.init(db)
+    pasarguard.init(db)
     has_saved_secrets = db.execute("""
         SELECT 1 FROM servers WHERE secret IS NOT NULL
         UNION ALL SELECT 1 FROM kamatera_accounts
@@ -273,6 +275,8 @@ def init_servers(db):
         UNION ALL SELECT 1 FROM cloudflare_profiles
         UNION ALL SELECT 1 FROM vultr_accounts
         UNION ALL SELECT 1 FROM cherry_accounts
+        UNION ALL SELECT 1 FROM pasarguard_accounts
+        UNION ALL SELECT 1 FROM pasarguard_installs
         UNION ALL SELECT 1 FROM cloud_saved_pending WHERE secret IS NOT NULL
         UNION ALL SELECT 1 FROM node_replacements WHERE recipe IS NOT NULL LIMIT 1
     """).fetchone()
@@ -350,6 +354,7 @@ def menu(owner):
         [InlineKeyboardButton("🌐 Cloudflare", callback_data="cloudflare"),
          InlineKeyboardButton("🍒 سرور Cherry", callback_data="cherry")],
     ])
+    rows.append([InlineKeyboardButton("🛡 پاسارگارد", callback_data="pg")])
     if owner:
         rows.append([InlineKeyboardButton("👑 پنل مدیریت", callback_data="license_panel")])
     return InlineKeyboardMarkup(rows)
@@ -945,6 +950,8 @@ async def operate(message, state, client, command=None):
                 await message.reply_text(label if value else f"{label} در خروجی پیدا نشد.")
                 if value:
                     await send_code(message, value, copy=True)
+            if all(data):
+                await offer_panel_registration(message, client, sudo, *data)
         return
     if action == "on":
         command = ENABLE.replace("SUDO ", sudo)
@@ -1575,6 +1582,205 @@ async def show_cloud_picker(
         prompt if choices else empty_prompt,
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
+
+
+async def offer_panel_registration(message, client, sudo, api_key, cert):
+    read_settings = "grep -E '^(SERVICE_PORT|SERVICE_PROTOCOL|API_PORT)[[:space:]]*=' /opt/pg-node/.env"
+    try:
+        ssh_host = client.get_transport().sock.getpeername()[0]
+        ip = str(ip_address(ssh_host))
+        code, output = await asyncio.to_thread(run, client, sudo + read_settings)
+        if code:
+            raise ValueError
+        settings = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+        settings = {key.strip(): value.strip().strip('"\'') for key, value in settings.items()}
+        protocol = settings["SERVICE_PROTOCOL"]
+        port = int(settings["SERVICE_PORT"])
+        api_port = int(settings.get("API_PORT", 62051))
+        if protocol not in {"grpc", "rest"} or not all(1 <= value <= 65535 for value in (port, api_port)):
+            raise ValueError
+    except (OSError, AttributeError, KeyError, ValueError, paramiko.SSHException):
+        await message.reply_text("خواندن IP، پروتکل یا پورت‌های نود برای ثبت در پنل ناموفق بود.")
+        return
+    ticket = pasarguard.save_install(ADMIN_DB, SERVER_CIPHER, message.chat_id, {
+        "name": ip, "address": ip, "server_ca": cert, "api_key": api_key,
+        "port": port, "api_port": api_port, "connection_type": protocol, "keep_alive": 60,
+    })
+    await message.reply_text("نود آمادهٔ ثبت در پنل پاسارگارد است.", reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ اضافه‌کردن به پنل پاسارگارد", callback_data=f"pg:add:{ticket}")],
+    ]))
+
+
+def panel_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔑 تنظیم اتصال پنل", callback_data="pg:key")],
+        [InlineKeyboardButton("🎯 اینباند پیش‌فرض Host نودها", callback_data="pg:default")],
+        [InlineKeyboardButton("🔀 تغییر اینباند Host موجود", callback_data="pg:hosts")],
+    ])
+
+
+async def panel_credentials_text(update, context):
+    message = update.message
+    values = message.text.strip().splitlines()
+    await delete_secret_message(message)
+    try:
+        if len(values) not in (2, 3) or not all(line.strip() for line in values):
+            raise pasarguard.PanelError("آدرس و توکن را در دو خط یا آدرس، نام کاربری و رمز را در سه خط بفرست.")
+        url, *credentials = (line.strip() for line in values)
+        url = url.rstrip("/")
+        async with pasarguard.connect(url, credentials) as panel:
+            await panel.cores()
+        pasarguard.save_account(ADMIN_DB, SERVER_CIPHER, update.effective_user.id, url, credentials)
+    except (pasarguard.PanelError, KeyError, TypeError) as error:
+        await message.reply_text(str(error) if isinstance(error, pasarguard.PanelError) else "پاسخ API پنل معتبر نبود.")
+        return
+    clear(context)
+    await message.reply_text("اتصال پنل ذخیره شد. حالا اینباند پیش‌فرض را انتخاب کن.", reply_markup=panel_menu())
+
+
+async def panel_picker(message, state, step, choices, prompt):
+    state.update(step=step, choices=choices, prompt=prompt)
+    await show_cloud_picker(message, state, 0, prompt, "pgp", "🛡 منوی پاسارگارد", "pg")
+
+
+async def panel_button(update, context):
+    query = update.callback_query
+    await query.answer()
+    if not private_admin(update):
+        return
+    user_id = update.effective_user.id
+    message = query.message
+    action = query.data
+    try:
+        if action in ("pg", "pg:key"):
+            clear(context)
+            if action == "pg":
+                await message.reply_text("پنل پاسارگارد", reply_markup=panel_menu())
+            else:
+                context.user_data["pasarguard"] = {"step": "credentials"}
+                await message.reply_text(
+                    "آدرس HTTPS پنل و توکن دسترسی را در دو خط بفرست. "
+                    "برای ورود خودکار می‌توانی آدرس، نام کاربری و رمز پنل را در سه خط بفرستی."
+                )
+            return
+        url, credentials, core_id, inbound = pasarguard.account(ADMIN_DB, SERVER_CIPHER, user_id)
+        state = context.user_data.get("pasarguard", {})
+        if action.startswith("pgp:"):
+            _, nonce, selection = action.split(":", 2)
+            if nonce != state.get("nonce"):
+                raise pasarguard.PanelError("این دکمه قدیمی است. دوباره از منوی پاسارگارد وارد شو.")
+            if selection.startswith("page:"):
+                await show_cloud_picker(
+                    message, state, int(selection.split(":")[1]), state["prompt"], "pgp", "🛡 منوی پاسارگارد", "pg",
+                )
+                return
+        else:
+            clear(context)
+            state = context.user_data["pasarguard"] = {"url": url}
+        if action.startswith(("pg:add:", "pg:confirm:")):
+            if not inbound or core_id is None:
+                raise pasarguard.PanelError("ابتدا Core و اینباند پیش‌فرض Host را انتخاب کن.")
+            ticket = action.split(":")[2]
+            draft = pasarguard.load_install(ADMIN_DB, SERVER_CIPHER, user_id, ticket)
+            node = draft["node"]
+            target = [url, core_id, inbound]
+            if draft.get("target", target) != target:
+                raise pasarguard.PanelError("تنظیمات مقصد این ثبت تغییر کرده است. تنظیمات قبلی را بررسی کن.")
+            if draft.get("completed"):
+                await message.reply_text(f"نود و Host {draft['remark']} قبلاً ثبت شده‌اند.")
+                return
+            if action.startswith("pg:add:"):
+                if "target" not in draft:
+                    draft["target"] = target
+                    pasarguard.update_install(ADMIN_DB, SERVER_CIPHER, user_id, ticket, draft)
+                await message.reply_text(
+                    f"نود {node['name']} و یک Host با همین IP روی اینباند {inbound} ثبت شود؟",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("✅ ثبت نود و Host", callback_data=f"pg:confirm:{ticket}"),
+                    ]]),
+                )
+                return
+            async with pasarguard.connect(url, credentials) as panel:
+                if inbound not in await panel.inbounds(core_id):
+                    raise pasarguard.PanelError("اینباند پیش‌فرض دیگر روی Core انتخابی در دسترس نیست.")
+                hosts = await panel.hosts()
+                await panel.ensure_node(dict(node, core_config_id=core_id))
+                if "remark" not in draft:
+                    draft["remark"] = pasarguard.reserve_remark(ADMIN_DB, user_id, hosts)
+                    pasarguard.update_install(ADMIN_DB, SERVER_CIPHER, user_id, ticket, draft)
+                try:
+                    await panel.ensure_host(draft["remark"], node["address"], inbound, hosts)
+                except pasarguard.PanelError as error:
+                    raise pasarguard.PanelError(
+                        f"نود در پنل ثبت شده، اما ثبت Host کامل نشد. {error} برای تلاش دوباره همان دکمهٔ ثبت را بزن."
+                    ) from None
+            draft["completed"] = True
+            draft["node"] = {"name": node["name"], "address": node["address"]}
+            pasarguard.update_install(ADMIN_DB, SERVER_CIPHER, user_id, ticket, draft)
+            await message.reply_text(f"✅ نود {node['name']} و Host {draft['remark']} روی اینباند {inbound} ثبت شدند.")
+            return
+        async with pasarguard.connect(url, credentials) as panel:
+            if action == "pg:default":
+                await panel_picker(message, state, "core", [
+                    (core["id"], f"{core['name']} · {core['id']}") for core in await panel.cores()
+                ], "Core نودهای جدید را انتخاب کن.")
+                return
+            if action == "pg:hosts":
+                await panel_picker(message, state, "host", [
+                    (host["id"], f"{host['remark']} · {host['inbound_tag'] or '—'}") for host in await panel.hosts()
+                ], "Host موردنظر را برای تغییر اینباند انتخاب کن.")
+                return
+            if state["url"] != url:
+                raise pasarguard.PanelError("اتصال پنل تغییر کرده است. فهرست را دوباره باز کن.")
+            if selection == "confirm":
+                if state["step"] != "confirm_host":
+                    return
+                host_id, tag = state["host_id"], state["tag"]
+                host = await panel.request("GET", f"host/{host_id}")
+                if host["inbound_tag"] != state["previous_tag"]:
+                    raise pasarguard.PanelError("اینباند Host در پنل تغییر کرده است. Host را دوباره انتخاب کن.")
+                await panel.request("PUT", f"host/{host_id}", json=dict(host, inbound_tag=tag))
+                clear(context)
+                await message.reply_text(f"اینباند Host {host['remark']} به {tag} تغییر کرد.", reply_markup=panel_menu())
+                return
+            index = int(selection.split(":")[1])
+            value, _ = state["choices"][index]
+            if state["step"] == "core":
+                state["core_id"] = value
+                await panel_picker(message, state, "default_inbound", [
+                    (tag, tag) for tag in await panel.inbounds(value)
+                ], "اینباندی را انتخاب کن که Host نودهای جدید روی آن ساخته شود.")
+            elif state["step"] == "default_inbound":
+                with ADMIN_DB:
+                    ADMIN_DB.execute(
+                        "UPDATE pasarguard_accounts SET core_id = ?, inbound = ? WHERE user_id = ?",
+                        (state["core_id"], value, user_id),
+                    )
+                clear(context)
+                await message.reply_text(
+                    f"اینباند پیش‌فرض {value} ذخیره شد. Host نودهای جدید با IP نود و نام‌های HERM1، HERM2 و … ساخته می‌شوند.",
+                    reply_markup=panel_menu(),
+                )
+            elif state["step"] == "host":
+                host = await panel.request("GET", f"host/{value}")
+                state.update(host_id=value, previous_tag=host["inbound_tag"], host_remark=host["remark"])
+                tags = set()
+                for core in await panel.cores():
+                    tags.update(await panel.inbounds(core["id"]))
+                await panel_picker(message, state, "host_inbound", [
+                    (tag, tag) for tag in sorted(tags) if tag != host["inbound_tag"]
+                ], f"اینباند جدید برای {host['remark']} را انتخاب کن.")
+            elif state["step"] == "host_inbound":
+                state.update(step="confirm_host", tag=value)
+                await message.reply_text(
+                    f"اینباند Host {state['host_remark']} به {value} تغییر کند؟",
+                    reply_markup=nonce_keyboard(state, [[("✅ تأیید تغییر", "confirm")]], "pgp"),
+                )
+    except (pasarguard.PanelError, InvalidToken, KeyError, TypeError, IndexError) as error:
+        await message.reply_text(
+            str(error) if isinstance(error, pasarguard.PanelError) else "خواندن تنظیمات یا پاسخ پنل ناموفق بود.",
+            reply_markup=panel_menu(),
+        )
 
 
 async def show_linode_details(message, state, token):
@@ -4217,6 +4423,9 @@ async def handle_text(update, context):
         return
     state = context.user_data
     message = update.message
+    if "pasarguard" in state and state["pasarguard"]["step"] == "credentials":
+        await panel_credentials_text(update, context)
+        return
     if state.get("action") == "ssl" and "ssl_domain" not in state:
         await ssl_request_text(update, context)
         return
@@ -4385,6 +4594,10 @@ if __name__ == "__main__":
         host_check_button, pattern=r"^(?:host_checks|hc:(?:ping|info))$",
     ))
     add(CallbackQueryHandler(select, pattern=r"^(ssh|node|ssl|on|off|update)$"))
+    add(CallbackQueryHandler(
+        panel_button,
+        pattern=r"^(?:pg|pg:(?:key|default|hosts|(?:add|confirm):[a-f0-9]{24})|pgp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|confirm))$",
+    ))
     add(CallbackQueryHandler(
         cherry_button,
         pattern=r"^(?:cherry|ch:(?:key|new|servers|balance)|chp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|power-on|power-off|reboot|delete|password|refresh|list|balance|confirm))$",
