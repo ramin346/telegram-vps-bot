@@ -4348,13 +4348,20 @@ async def replacement_watch(bot, rule, recipe, now):
             return
         async with httpx.AsyncClient(timeout=8, follow_redirects=False) as client:
             networks = await host_monitor.aws_networks(client)
-            status = await host_monitor.check_ip(client, rule.target, networks)
+            status = await host_monitor.check_ip(client, rule.target, networks, minimum_timeout_nodes=2)
     except (*REPLACEMENT_ERRORS, ValueError):
         status = "unknown"
     if status != "down" or not rule.evidence:
+        notes = {
+            "down": "حداقل دو نود ایران تایم‌اوت دادند. بررسی تأییدی حدود دو دقیقه دیگر انجام می‌شود.",
+            "ok": "در آخرین پایش دست‌کم یک نود ایران پاسخ گرفت.",
+            "aws": "IP متعلق به Amazon/AWS است و از پایش کنار گذاشته شد.",
+            "provider_unknown": "در آخرین بررسی، سرویس تشخیص ISP نتیجه نداد.",
+        }
         replacement.update(
             ADMIN_DB, rule, evidence=int(status == "down"),
             next_at=now + (120 if status == "down" else delay),
+            note=notes.get(status, "آخرین پایش نتیجهٔ قطعی نداشت. برای جایگزینی حداقل دو تایم‌اوت لازم است."),
         )
         return
     try:

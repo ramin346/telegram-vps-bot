@@ -106,7 +106,7 @@ async def aws_networks(client):
         return []
 
 
-def ping_status(nodes, results):
+def ping_status(nodes, results, *, minimum_timeout_nodes=None):
     if not nodes:
         return "unknown"
     timeout_nodes = 0
@@ -118,10 +118,11 @@ def ping_status(nodes, results):
             return "ok"
         if "TIMEOUT" in statuses:
             timeout_nodes += 1
-    return "down" if timeout_nodes == len(nodes) else "unknown"
+    required = len(nodes) if minimum_timeout_nodes is None else minimum_timeout_nodes
+    return "down" if timeout_nodes >= required else "unknown"
 
 
-async def check_ip(client, ip, networks):
+async def check_ip(client, ip, networks, *, minimum_timeout_nodes=None):
     address = ip_address(ip)
     if any(address in network for network in networks):
         return "aws"
@@ -137,7 +138,7 @@ async def check_ip(client, ip, networks):
             nodes, results = await host_checks.ping_iran(ip)
         except host_checks.CheckError:
             return "unknown"
-    return ping_status(nodes, results)
+    return ping_status(nodes, results, minimum_timeout_nodes=minimum_timeout_nodes)
 
 
 async def resolve(host):
