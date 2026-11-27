@@ -1,3 +1,5 @@
+from decimal import Decimal, InvalidOperation
+import re
 from urllib.parse import quote
 
 import httpx
@@ -99,3 +101,25 @@ async def change_server(token, server_id, operation):
         await request("POST", f"{path}/actions", token, payload={"type": operation})
     else:
         raise ValueError("Invalid Cherry Servers operation")
+
+
+async def team_balance(token, team_id):
+    team = await request("GET", f"/teams/{team_id}", token)
+    if not isinstance(team, dict) or team.get("id") != team_id:
+        raise APIError()
+    credit = team.get("credit") or {}
+    billing = team.get("billing") or {}
+    balances = {}
+    for key in ("account", "promo"):
+        entry = credit.get(key) or {}
+        value = entry.get("remaining")
+        currency = entry.get("currency") or billing.get("currency")
+        if not isinstance(currency, str) or not re.fullmatch(r"[A-Z]{3}", currency) or value is None:
+            continue
+        try:
+            amount = Decimal(str(value))
+        except InvalidOperation:
+            continue
+        if amount.is_finite() and amount.adjusted() < 15:
+            balances[key] = f"{amount:,.2f} {currency}"
+    return str(team.get("name") or team_id)[:120], balances

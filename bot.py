@@ -3458,6 +3458,24 @@ async def show_cherry_password(message, state, server, title):
     await message.reply_text(title, protect_content=bool(password), reply_markup=InlineKeyboardMarkup(keyboard))
 
 
+async def show_cherry_balance(message, state, token):
+    name, balances = await cherry.team_balance(token, state["team"])
+    state["step"] = "balance"
+    lines = [
+        f"💳 موجودی Cherry Servers · {name}",
+        f"اعتبار حساب: {balances.get('account', 'اعلام نشده')}",
+    ]
+    if "promo" in balances:
+        lines.append(f"اعتبار تشویقی: {balances['promo']}")
+    await message.reply_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup([
+            *cherry_keyboard(state, [[("🔄 تازه‌سازی موجودی", "balance")]]).inline_keyboard,
+            [InlineKeyboardButton("انتخاب تیم", callback_data="ch:balance")],
+        ]),
+    )
+
+
 async def cherry_button(update, context):
     query = update.callback_query
     if not private_admin(update):
@@ -3482,6 +3500,7 @@ async def cherry_button(update, context):
     if action == "cherry":
         await message.reply_text("مدیریت Cherry Servers", reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🔑 ثبت یا تعویض توکن API", callback_data="ch:key")],
+            [InlineKeyboardButton("💳 موجودی حساب", callback_data="ch:balance")],
             [InlineKeyboardButton("➕ ساخت VPS", callback_data="ch:new"),
              InlineKeyboardButton("🖥 سرورهای موجود", callback_data="ch:servers")],
         ]))
@@ -3498,7 +3517,7 @@ async def cherry_button(update, context):
         await message.reply_text("ابتدا توکن Cherry Servers را ثبت کن.")
         return
     try:
-        if action in {"ch:new", "ch:servers"}:
+        if action in {"ch:new", "ch:servers", "ch:balance"}:
             teams = await cherry.catalog("/teams", token)
             state.update(step="team", mode=action, form={}, choices=[
                 (row["id"], str(row.get("name") or row["id"])) for row in teams
@@ -3512,6 +3531,8 @@ async def cherry_button(update, context):
                     await cherry_picker(message, state, index)
             elif index < len(state["choices"]):
                 await cherry_pick(message, state, token, index)
+        elif action == "balance":
+            await show_cherry_balance(message, state, token)
         elif action == "list":
             await cherry_list_servers(message, state, token)
         elif action == "refresh":
@@ -3549,6 +3570,10 @@ async def cherry_pick(message, state, token, index):
     step = state["step"]
     form = state["form"]
     if step == "team":
+        if state["mode"] == "ch:balance":
+            state["team"] = int(value)
+            await show_cherry_balance(message, state, token)
+            return
         projects = await cherry.catalog(f"/teams/{int(value)}/projects", token)
         state.update(team=int(value), step="project", choices=[
             (row["id"], str(row.get("name") or row["id"])) for row in projects
@@ -4362,7 +4387,7 @@ if __name__ == "__main__":
     add(CallbackQueryHandler(select, pattern=r"^(ssh|node|ssl|on|off|update)$"))
     add(CallbackQueryHandler(
         cherry_button,
-        pattern=r"^(?:cherry|ch:(?:key|new|servers)|chp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|power-on|power-off|reboot|delete|password|refresh|list|confirm))$",
+        pattern=r"^(?:cherry|ch:(?:key|new|servers|balance)|chp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|power-on|power-off|reboot|delete|password|refresh|list|balance|confirm))$",
     ))
     add(CallbackQueryHandler(
         vultr_button,
