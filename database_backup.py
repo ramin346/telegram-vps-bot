@@ -30,6 +30,7 @@ TABLES = {
     "vultr_accounts": (("user_id", "i"), ("token", "s")),
     "pasarguard_accounts": (("user_id", "i"), ("url", "t"), ("credentials", "s"),
                            ("core_id", "i?"), ("inbound", "t?"), ("next_number", "i")),
+    "aws_accounts": (("user_id", "i"), ("credentials", "s")),
     "cherry_accounts": (("user_id", "i"), ("token", "s")),
     "host_monitors": (("user_id", "i"), ("hosts", "t"), ("next_at", "i")),
     "host_monitor_settings": (("user_id", "i"), ("interval", "i")),
@@ -89,7 +90,7 @@ def restore_file(data, password, storage_cipher):
     try:
         payload = password_cipher(password, data[len(MAGIC):end]).decrypt(data[end:])
         contents = json.loads(payload)
-        optional = {"pasarguard_accounts", "node_replacements", "host_monitor_settings", "cherry_accounts", "cloud_saved_names", "cloud_saved_pending", "dns_rotations", "vultr_accounts", "server_folders", "server_folder_members", "host_monitors", "cloudflare_profiles"}
+        optional = {"aws_accounts", "pasarguard_accounts", "node_replacements", "host_monitor_settings", "cherry_accounts", "cloud_saved_names", "cloud_saved_pending", "dns_rotations", "vultr_accounts", "server_folders", "server_folder_members", "host_monitors", "cloudflare_profiles"}
         if not isinstance(contents, dict) or not TABLES.keys() - optional <= contents.keys() <= TABLES.keys():
             raise ValueError
         rotations = contents.get("dns_rotations", [])

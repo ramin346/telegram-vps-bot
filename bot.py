@@ -1,6 +1,7 @@
 import asyncio
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
+import hashlib
 from html import escape
 from io import StringIO
 from ipaddress import IPv6Address, ip_address
@@ -30,6 +31,7 @@ from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters,
 )
 
+import aws_ec2
 import cherry
 import cloudflare
 import cloud_saved
@@ -264,6 +266,8 @@ def init_servers(db):
         """)
     with db:
         db.execute("CREATE TABLE IF NOT EXISTS cherry_accounts (user_id INTEGER PRIMARY KEY, token BLOB NOT NULL)")
+    with db:
+        db.execute("CREATE TABLE IF NOT EXISTS aws_accounts (user_id INTEGER PRIMARY KEY, credentials BLOB NOT NULL)")
     cloud_saved.init(db)
     replacement.init(db)
     dns_rotation.init(db)
@@ -278,6 +282,7 @@ def init_servers(db):
         UNION ALL SELECT 1 FROM cloudflare_profiles
         UNION ALL SELECT 1 FROM vultr_accounts
         UNION ALL SELECT 1 FROM cherry_accounts
+        UNION ALL SELECT 1 FROM aws_accounts
         UNION ALL SELECT 1 FROM pasarguard_accounts
         UNION ALL SELECT 1 FROM pasarguard_installs
         UNION ALL SELECT 1 FROM cloud_saved_pending WHERE secret IS NOT NULL
@@ -357,7 +362,8 @@ def menu(owner):
         [InlineKeyboardButton("🌐 Cloudflare", callback_data="cloudflare"),
          InlineKeyboardButton("🍒 سرور Cherry", callback_data="cherry")],
     ])
-    rows.append([InlineKeyboardButton("🛡 پاسارگارد", callback_data="pg")])
+    rows.append([InlineKeyboardButton("🛡 پاسارگارد", callback_data="pg"),
+                 InlineKeyboardButton("☁️ سرور AWS", callback_data="aws")])
     if owner:
         rows.append([InlineKeyboardButton("👑 پنل مدیریت", callback_data="license_panel")])
     return InlineKeyboardMarkup(rows)
@@ -1608,6 +1614,213 @@ async def show_cloud_picker(
         prompt if choices else empty_prompt,
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
+
+
+AWS_STEPS = {
+    "image": ("سیستم‌عامل را انتخاب کن.", aws_ec2.images),
+    "subnet": ("Subnet سرور را انتخاب کن.", aws_ec2.subnets),
+    "type": ("نوع سرور را انتخاب کن.", aws_ec2.types),
+    "group": ("Security Group همین VPC را انتخاب کن.", aws_ec2.groups),
+    "key": ("کلید SSH موجود در این منطقه را انتخاب کن.", aws_ec2.keys),
+}
+
+
+def aws_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 سرورهای موجود", callback_data="aws:list")],
+        [InlineKeyboardButton("➕ ساخت سرور EC2", callback_data="aws:new")],
+        [InlineKeyboardButton("🔑 تنظیم اتصال AWS", callback_data="aws:key")],
+    ])
+
+
+def aws_credentials(user_id):
+    row = ADMIN_DB.execute("SELECT credentials FROM aws_accounts WHERE user_id = ?", (user_id,)).fetchone()
+    if not row:
+        raise aws_ec2.APIError("اول اتصال AWS را از بخش «تنظیم اتصال AWS» ثبت کن.")
+    return row[0]
+
+
+async def aws_picker(message, state, step, choices, prompt):
+    state.update(step=step, choices=choices, prompt=prompt)
+    await show_cloud_picker(message, state, 0, prompt, "awp", "☁️ منوی AWS", "aws")
+
+
+async def aws_show_instance(message, state, instance):
+    if not instance:
+        await message.reply_text("این سرور در منطقهٔ انتخاب‌شده پیدا نشد.", reply_markup=aws_menu())
+        return
+    status = instance["State"]["Name"]
+    state.update(step="detail", instance_id=instance["InstanceId"])
+    buttons = [[("🔄 تازه‌سازی وضعیت", "refresh")]]
+    allowed = {"running": ("stop", "reboot", "terminate"), "stopped": ("start", "terminate"),
+               "pending": ("terminate",), "stopping": ("terminate",)}
+    buttons.extend([[(aws_ec2.ACTIONS[action][1], action)] for action in allowed.get(status, ())])
+    buttons.append([("📋 فهرست این منطقه", "list")])
+    ipv6 = [addr["Ipv6Address"] for interface in instance.get("NetworkInterfaces", [])
+            for addr in interface.get("Ipv6Addresses", [])]
+    await message.reply_text(
+        f"{aws_ec2.name(instance)}\nشناسه: {instance['InstanceId']}\n"
+        f"منطقه: {state['region']}\nنوع: {instance.get('InstanceType', '—')}\nوضعیت: {status}\n"
+        f"IPv4 عمومی: {instance.get('PublicIpAddress', '—')}\nIPv4 خصوصی: {instance.get('PrivateIpAddress', '—')}"
+        + (f"\nIPv6: {', '.join(ipv6)}" if ipv6 else ""),
+        reply_markup=nonce_keyboard(state, buttons, "awp"),
+    )
+
+
+async def aws_list(message, state, call):
+    rows = await call(aws_ec2.instances)
+    await aws_picker(message, state, "instances", [
+        (row["InstanceId"], f"{aws_ec2.name(row)} · {row['State']['Name']} · {row.get('PublicIpAddress', '—')}")
+        for row in rows
+    ], f"سرورهای EC2 در {state['region']}")
+
+
+async def aws_create_step(message, state, step, call):
+    prompt, load = AWS_STEPS[step]
+    args = [state["form"]["subnet"]] if step in {"type", "group"} else []
+    choices = await call(load, *args)
+    await aws_picker(message, state, step, choices, prompt)
+
+
+async def aws_text(update, context):
+    state = context.user_data["aws"]
+    message = update.message
+    value = message.text.strip()
+    if state["step"] == "credentials":
+        credentials = value.splitlines()
+        await delete_secret_message(message)
+        if len(credentials) not in (2, 3) or any(not re.fullmatch(r"[!-~]{8,4096}", item) for item in credentials):
+            await message.reply_text("Access Key ID و Secret Access Key را در دو خط بفرست. برای کلید موقت، Session Token را خط سوم بفرست.")
+            return
+        try:
+            await asyncio.to_thread(aws_ec2.call, credentials, "us-east-1", aws_ec2.regions)
+        except aws_ec2.APIError as exc:
+            await message.reply_text(str(exc))
+            return
+        with ADMIN_DB:
+            ADMIN_DB.execute("""
+                INSERT INTO aws_accounts VALUES (?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET credentials = excluded.credentials
+            """, (update.effective_user.id, SERVER_CIPHER.encrypt(json.dumps(credentials).encode())))
+        clear(context)
+        await message.reply_text("اتصال AWS ذخیره شد.", reply_markup=aws_menu())
+    elif state["step"] == "name":
+        if not 1 <= len(value) <= 100 or not re.fullmatch(r"[\w .-]+", value):
+            await message.reply_text("یک نام حداکثر ۱۰۰ حرفی با حروف، عدد، فاصله یا خط تیره بفرست.")
+            return
+        form = state["form"]
+        form["name"] = value
+        state.update(step="confirm_create", request_id=secrets.token_hex(16))
+        await message.reply_text(
+            f"یک VPS هزینه‌دار در {state['region']} ساخته شود؟\n"
+            f"نام: {value}\nایمیج: {state['image_label']} ({form['image']})\n"
+            f"نوع: {form['type']}\nSubnet: {form['subnet']}\n"
+            f"Security Group: {form['group']}\nکلید SSH: {form['key']}\nIPv4 عمومی: فعال",
+            reply_markup=nonce_keyboard(state, [[("✅ تأیید ساخت EC2", "confirm")]], "awp"),
+        )
+
+
+async def aws_button(update, context):
+    query = update.callback_query
+    await query.answer()
+    if not private_admin(update):
+        return
+    message = query.message
+    action = query.data
+    user_id = update.effective_user.id
+    if action == "aws":
+        clear(context)
+        await message.reply_text("☁️ Amazon EC2", reply_markup=aws_menu())
+        return
+    if action == "aws:key":
+        clear(context)
+        context.user_data["aws"] = {"step": "credentials"}
+        await message.reply_text(
+            "Access Key ID و Secret Access Key حساب IAM را در دو خط بفرست. "
+            "اگر اعتبارنامه موقت است، Session Token را در خط سوم بفرست."
+        )
+        return
+
+    try:
+        encrypted = aws_credentials(user_id)
+        account_marker = hashlib.sha256(encrypted).hexdigest()
+        credentials = json.loads(SERVER_CIPHER.decrypt(encrypted))
+        if action in {"aws:list", "aws:new"}:
+            clear(context)
+            state = context.user_data["aws"] = {"intent": action, "account": account_marker}
+            regions = await asyncio.to_thread(aws_ec2.call, credentials, "us-east-1", aws_ec2.regions)
+            await aws_picker(message, state, "region", [(region, region) for region in regions], "منطقهٔ AWS را انتخاب کن.")
+            return
+
+        _, nonce, action = action.split(":", 2)
+        state = context.user_data.get("aws", {})
+        if nonce != state.get("nonce") or account_marker != state.get("account"):
+            await message.reply_text("این دکمه منقضی شده است. دوباره از منوی AWS وارد شو.", reply_markup=aws_menu())
+            return
+
+        async def call(operation, *args):
+            return await asyncio.to_thread(aws_ec2.call, credentials, state["region"], operation, *args)
+
+        step = state["step"]
+        if action.startswith("page:"):
+            page = int(action.split(":")[1])
+            if page * 8 < len(state["choices"]):
+                await show_cloud_picker(message, state, page, state["prompt"], "awp", "☁️ منوی AWS", "aws")
+        elif action.startswith("pick:"):
+            index = int(action.split(":")[1])
+            if index >= len(state["choices"]):
+                return
+            value, label = state["choices"][index]
+            if step == "region":
+                state.update(region=value, form={})
+                if state["intent"] == "aws:list":
+                    await aws_list(message, state, call)
+                else:
+                    await aws_create_step(message, state, "image", call)
+            elif step == "instances":
+                await aws_show_instance(message, state, await call(aws_ec2.details, value))
+            elif step in AWS_STEPS:
+                state["form"][step] = value
+                if step == "image":
+                    state["image_label"] = label
+                if step == "key":
+                    state.update(step="name", nonce=None)
+                    await message.reply_text("نام سرور را بفرست.")
+                else:
+                    steps = tuple(AWS_STEPS)
+                    await aws_create_step(message, state, steps[steps.index(step) + 1], call)
+        elif action == "confirm" and step == "confirm_create":
+            instance_id = await call(aws_ec2.create, state["form"], state["request_id"])
+            region = state["region"]
+            clear(context)
+            await message.reply_text(
+                f"درخواست ساخت EC2 ثبت شد.\nشناسه: {instance_id}\nمنطقه: {region}\n"
+                "برای دیدن IP پس از آماده‌شدن، سرورهای موجود همین منطقه را باز کن.",
+                reply_markup=aws_menu(),
+            )
+        elif action == "list":
+            await aws_list(message, state, call)
+        elif action == "refresh" and step == "detail":
+            await aws_show_instance(message, state, await call(aws_ec2.details, state["instance_id"]))
+        elif action in aws_ec2.ACTIONS and step == "detail":
+            state.update(step="confirm_action", operation=action)
+            caption = aws_ec2.ACTIONS[action][1]
+            await message.reply_text(
+                f"{caption}\nسرور {state['instance_id']} در {state['region']}\nتأیید می‌کنی؟",
+                reply_markup=nonce_keyboard(state, [[("✅ تأیید عملیات", "confirm"), ("لغو و بازگشت", "list")]], "awp"),
+            )
+        elif action == "confirm" and step == "confirm_action":
+            operation = state["operation"]
+            instance_id = state["instance_id"]
+            await call(aws_ec2.change, instance_id, operation)
+            state.update(step="detail", nonce=None)
+            await message.reply_text("درخواست در AWS ثبت شد.", reply_markup=nonce_keyboard(state, [
+                [("📋 فهرست این منطقه", "list"), ("🔄 تازه‌سازی وضعیت", "refresh")],
+            ], "awp"))
+    except aws_ec2.APIError as exc:
+        await message.reply_text(str(exc), reply_markup=aws_menu())
+    except InvalidToken:
+        await message.reply_text("اعتبارنامه AWS باز نشد. دوباره آن را ثبت کن.", reply_markup=aws_menu())
 
 
 async def offer_panel_registration(message, client, sudo, api_key, cert):
@@ -3203,7 +3416,7 @@ async def backup_text(update, context):
     await message.reply_text(
         f"بکاپ خوانده شد: {len(rows['servers'])} سرور ذخیره‌شده، "
         f"{len(rows['admins'])} ادمین اضافه‌شده و "
-        f"{sum(len(rows[name]) for name in ('kamatera_accounts', 'linode_accounts', 'hetzner_projects', 'cloudflare_accounts', 'cloudflare_profiles', 'vultr_accounts', 'cherry_accounts'))} حساب سرویس.\n"
+        f"{sum(len(rows[name]) for name in ('kamatera_accounts', 'linode_accounts', 'hetzner_projects', 'cloudflare_accounts', 'cloudflare_profiles', 'vultr_accounts', 'cherry_accounts', 'aws_accounts'))} حساب سرویس.\n"
         "با تأیید، اطلاعات ذخیره‌شدهٔ فعلی ربات با اطلاعات این فایل جایگزین می‌شود.",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("تأیید جایگزینی دیتابیس", callback_data=confirmation)],
@@ -4568,6 +4781,9 @@ async def handle_text(update, context):
         return
     state = context.user_data
     message = update.message
+    if state.get("aws", {}).get("step") in {"credentials", "name"}:
+        await aws_text(update, context)
+        return
     if state.get("panel_install_step") in {"domain", "email", "confirm"}:
         await panel_install_text(update, context)
         return
@@ -4742,6 +4958,10 @@ if __name__ == "__main__":
     ))
     add(CallbackQueryHandler(
         host_check_button, pattern=r"^(?:host_checks|hc:(?:ping|info))$",
+    ))
+    add(CallbackQueryHandler(
+        aws_button,
+        pattern=r"^(?:aws(?::(?:list|new|key))?|awp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|confirm|list|refresh|start|stop|reboot|terminate))$",
     ))
     add(CallbackQueryHandler(panel_install_button, pattern=r"^pg:install(?::confirm:[a-f0-9]{16})?$"))
     add(CallbackQueryHandler(select, pattern=r"^(ssh|node|ssl|on|off|update)$"))
