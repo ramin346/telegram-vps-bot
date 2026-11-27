@@ -35,6 +35,7 @@ import host_checks
 import host_monitor
 import kamatera
 import linode
+import navigation
 import vultr
 
 ROOT = Path(__file__).resolve().parent
@@ -342,8 +343,26 @@ def menu(owner):
     return InlineKeyboardMarkup(rows)
 
 
+async def navigation_button(update, context):
+    query = update.callback_query
+    await query.answer()
+    if not private_admin(update):
+        return
+    chat_id = update.effective_chat.id
+    page = navigation.previous(chat_id) if query.data == navigation.BACK else None
+    clear(context)
+    if page is None:
+        navigation.reset(chat_id)
+        await query.message.reply_text("عملیات سرور را انتخاب کن.", reply_markup=menu(private_operator(update)))
+        return
+    state, markup = navigation.reissue(page, context.bot)
+    context.user_data.update(state)
+    await query.message.reply_text(page.text, reply_markup=markup)
+
+
 async def start(update, context):
     if private_admin(update):
+        navigation.reset(update.effective_chat.id)
         clear(context)
         await update.message.reply_text("عملیات سرور را انتخاب کن.", reply_markup=menu(private_operator(update)))
     elif update.effective_chat.type == "private":
@@ -734,6 +753,7 @@ async def license_button(update, context):
                     ("لایسنس کاربر لغو شد.", user_id),
                 )
             ADDED_ADMINS.discard(user_id)
+            navigation.reset(user_id)
             user_state = context.application.user_data.get(user_id)
             if user_state is not None:
                 clear_user_data(user_state)
@@ -763,6 +783,7 @@ async def cancel(update, context):
         return
     if update.callback_query:
         await update.callback_query.answer()
+    navigation.reset(update.effective_chat.id)
     clear(context)
     await update.effective_message.reply_text("اتصال بسته شد. عملیات بعدی را انتخاب کن.", reply_markup=menu(private_operator(update)))
 
@@ -2729,6 +2750,7 @@ async def backup_button(update, context):
             return
         ADDED_ADMINS.clear()
         ADDED_ADMINS.update(row[0] for row in rows["admins"])
+        navigation.reset()
         for user_state in context.application.user_data.values():
             clear_user_data(user_state)
         await message.reply_text("دیتابیس بازیابی شد.", reply_markup=menu(True))
@@ -3433,6 +3455,11 @@ async def expire(context):
 async def report_error(update, context):
     # Exception messages and update bodies can include credentials.
     logging.error("Bot handler failed (%s)", type(context.error).__name__)
+    if getattr(update, "effective_message", None) and private_admin(update):
+        try:
+            await update.effective_message.reply_text("ادامهٔ این مرحله ناموفق بود. از مرحلهٔ قبل یا منوی اصلی دوباره شروع کن.")
+        except TelegramError:
+            pass
 
 
 if __name__ == "__main__":
@@ -3442,56 +3469,63 @@ if __name__ == "__main__":
     OWNER_IDS = set(configured_owners)
     ADMIN_DB, ADDED_ADMINS = load_admins()
     SERVER_CIPHER = init_servers(ADMIN_DB)
-    application = Application.builder().token(os.environ["TELEGRAM_BOT_TOKEN"]).build()
-    application.add_handler(CommandHandler(["start", "menu"], start))
-    application.add_handler(CommandHandler("cancel", cancel))
-    application.add_handler(CommandHandler("update", update_command))
-    application.add_handler(CallbackQueryHandler(cancel, pattern=r"^cancel$"))
-    application.add_handler(CallbackQueryHandler(
+    telegram_bot = navigation.NavigationBot(os.environ["TELEGRAM_BOT_TOKEN"], user_has_access)
+    application = Application.builder().bot(telegram_bot).build()
+
+    def add(handler):
+        handler.callback = navigation.track(handler.callback, user_has_access)
+        application.add_handler(handler)
+
+    application.add_handler(CallbackQueryHandler(navigation_button, pattern=r"^nav:(?:back|main)$"))
+    add(CommandHandler(["start", "menu"], start))
+    add(CommandHandler("cancel", cancel))
+    add(CommandHandler("update", update_command))
+    add(CallbackQueryHandler(cancel, pattern=r"^cancel$"))
+    add(CallbackQueryHandler(
         host_monitor_button, pattern=r"^(?:hc:monitor|hm:[a-f0-9]{16}:(?:add|test|(?:remove|page):[0-9]{1,8}))$",
     ))
-    application.add_handler(CallbackQueryHandler(
+    add(CallbackQueryHandler(
         host_check_button, pattern=r"^(?:host_checks|hc:(?:ping|info))$",
     ))
-    application.add_handler(CallbackQueryHandler(select, pattern=r"^(ssh|node|ssl|on|off|update)$"))
-    application.add_handler(CallbackQueryHandler(
+    add(CallbackQueryHandler(select, pattern=r"^(ssh|node|ssl|on|off|update)$"))
+    add(CallbackQueryHandler(
         vultr_button,
         pattern=r"^(?:vultr|vu:(?:key|new|list)|vp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|start|halt|reboot|delete|password|refresh|list|confirm))$",
     ))
-    application.add_handler(CallbackQueryHandler(
+    add(CallbackQueryHandler(
         backup_button, pattern=r"^(?:backup|db:(?:export|import|apply:[a-f0-9]{16}))$",
     ))
-    application.add_handler(CallbackQueryHandler(
+    add(CallbackQueryHandler(
         cloudflare_button,
         pattern=r"^(?:cloudflare|cf:(?:key|zones|add)|cp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|accounts|replace|zones|list|edit_list|search|dns|add|type:(?:A|AAAA|CNAME)|field:(?:name|content|proxied|ttl)|proxy:(?:on|off)|ttl:(?:1|60|300|600|1800|3600)|delete|confirm|rotate|rot_(?:next|review|confirm|list|refresh|now|cancel|delete|remove|page:[0-9]{1,8})))$",
     ))
-    application.add_handler(CallbackQueryHandler(
+    add(CallbackQueryHandler(
         hetzner_button,
         pattern=r"^(?:hetzner|he:add|hp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|new|replace|accounts|poweron|shutdown|reboot|refresh|list|delete|password|reset_status|confirm))$",
     ))
-    application.add_handler(CallbackQueryHandler(
+    add(CallbackQueryHandler(
         linode_button, pattern=r"^(?:linode|li:(?:key|new|servers)|lp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|boot|shutdown|reboot|refresh|list|delete|confirm))$",
     ))
-    application.add_handler(CallbackQueryHandler(kamatera_button, pattern=r"^(kamatera|km:(key|new|servers|status|make:[a-f0-9]{16}))$"))
-    application.add_handler(CallbackQueryHandler(
+    add(CallbackQueryHandler(kamatera_button, pattern=r"^(kamatera|km:(key|new|servers|status|make:[a-f0-9]{16}))$"))
+    add(CallbackQueryHandler(
         kamatera_create_button,
         pattern=r"^kmc:[a-f0-9]{16}:(?:pick|page|back):[0-9]{1,8}$",
     ))
-    application.add_handler(CallbackQueryHandler(
+    add(CallbackQueryHandler(
         kamatera_server_button,
         pattern=r"^kms:[a-f0-9]{16}:(?:(?:page|detail):[0-9]+|power:(?:on|off|restart)|(?:confirm|status|delete):0|confirm:delete)$",
     ))
-    application.add_handler(CallbackQueryHandler(my_servers, pattern=r"^my_servers$"))
-    application.add_handler(CallbackQueryHandler(
+    add(CallbackQueryHandler(my_servers, pattern=r"^my_servers$"))
+    add(CallbackQueryHandler(
         server_button,
         pattern=r"^s:[0-9a-f]{12}:(?:pick|page|new|connect|delete|folder_new|folders_page|folder|move|move_page|move_to|new_password):[0-9]{1,19}$",
     ))
-    application.add_handler(CallbackQueryHandler(
+    add(CallbackQueryHandler(
         license_button,
         pattern=r"^(?:license_panel|lic:(?:add|list)|licp:[a-f0-9]{16}:(?:(?:page|pick):[0-9]{1,8}|back|revoke))$",
     ))
-    application.add_handler(MessageHandler(filters.Document.ALL, backup_document))
-    application.add_handler(MessageHandler(filters.TEXT, handle_text))
+    add(MessageHandler(filters.Document.ALL, backup_document))
+    add(MessageHandler(filters.TEXT, handle_text))
     application.add_error_handler(report_error)
     application.job_queue.run_repeating(dns_rotation_job, interval=15, first=1)
     application.job_queue.run_repeating(host_monitor_job, interval=60, first=5)
