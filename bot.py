@@ -1552,7 +1552,10 @@ async def show_linode_picker(message, state, page=0):
     await show_cloud_picker(message, state, page, LINODE_PICKERS[state["step"]], "lp", "منوی Linode", "linode")
 
 
-async def show_cloud_picker(message, state, page, prompt, prefix, menu_label, menu_action):
+async def show_cloud_picker(
+    message, state, page, prompt, prefix, menu_label, menu_action, *,
+    extra_buttons=(), empty_prompt="گزینه‌ای برای نمایش پیدا نشد.",
+):
     choices = state["choices"]
     offset = page * 8
     rows = [
@@ -1567,9 +1570,9 @@ async def show_cloud_picker(message, state, page, prompt, prefix, menu_label, me
     if navigation:
         rows.append(navigation)
     markup = nonce_keyboard(state, rows, prefix)
-    keyboard = [*markup.inline_keyboard, [InlineKeyboardButton(menu_label, callback_data=menu_action)]]
+    keyboard = [*markup.inline_keyboard, *extra_buttons, [InlineKeyboardButton(menu_label, callback_data=menu_action)]]
     await message.reply_text(
-        prompt if choices else "گزینه‌ای برای نمایش پیدا نشد.",
+        prompt if choices else empty_prompt,
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -3790,7 +3793,30 @@ async def replacement_menu(message, state, user_id, page=0):
         (rule_id, f"{target} · {replacement.PROVIDERS.get(provider, provider)} · {REPLACEMENT_STATUS.get(status, status)}")
         for rule_id, target, provider, status in replacement.for_user(ADMIN_DB, user_id)
     ])
-    await show_cloud_picker(message, state, page, "برنامه‌های جایگزینی نود", "rp", "پایش IP", "hc:monitor")
+    await show_cloud_picker(
+        message, state, page, "برنامه‌های جایگزینی نود", "rp", "پایش IP", "hc:monitor",
+        extra_buttons=([InlineKeyboardButton("➕ افزودن IP", callback_data="replacement_add")],),
+        empty_prompt="هنوز برنامه‌ای ثبت نشده است. با «افزودن IP» شروع کن.",
+    )
+
+
+async def replacement_choose_provider(message, draft, target):
+    draft.update(target=target, mode="provider")
+    await message.reply_text(
+        f"IP مورد پایش: {target}\nسرویس ساخت VPS جایگزین را انتخاب کن.",
+        reply_markup=nonce_keyboard(
+            draft, [[(caption, f"provider:{provider}")] for provider, caption in replacement.PROVIDERS.items()], "rp",
+        ),
+    )
+
+
+async def replacement_ip_text(update, context):
+    message = update.message
+    target = cloud_saved.public_address([message.text.strip()])
+    if target is None or "/" in message.text or "%" in message.text:
+        await message.reply_text("یک آدرس IPv4 یا IPv6 عمومی بفرست، بدون دامنه یا پورت.")
+        return
+    await replacement_choose_provider(message, context.user_data["replacement"], target)
 
 
 async def replacement_button(update, context):
@@ -3804,6 +3830,12 @@ async def replacement_button(update, context):
         await query.answer()
         clear(context)
         await replacement_menu(message, context.user_data.setdefault("replacement", {}), user_id)
+        return
+    if query.data == "replacement_add":
+        await query.answer()
+        clear(context)
+        context.user_data["replacement"] = {"mode": "enter_ip", "rotation_id": replacement.DIRECT}
+        await message.reply_text("IP عمومی سروری را که می‌خواهی پایش شود بفرست. برای لغو /cancel را بزن.")
         return
     draft = context.user_data.get("replacement", {})
     _, nonce, action = query.data.split(":", 2)
@@ -3838,10 +3870,7 @@ async def replacement_button(update, context):
                 reply_markup=nonce_keyboard(draft, buttons, "rp"),
             )
         else:
-            draft["target"] = value
-            await message.reply_text("سرویس ساخت VPS جایگزین را انتخاب کن.", reply_markup=nonce_keyboard(
-                draft, [[(caption, f"provider:{provider}")] for provider, caption in replacement.PROVIDERS.items()], "rp",
-            ))
+            await replacement_choose_provider(message, draft, value)
         return
     if action.startswith("provider:"):
         provider = action.split(":")[1]
@@ -3861,19 +3890,21 @@ async def replacement_button(update, context):
     elif action in {"keep", "auto"}:
         if action == "auto" and not draft.get("old_id"):
             return
-        row = dns_rotation.get(ADMIN_DB, user_id, draft["rotation_id"])
-        if not row or row.status not in {"active", "done"}:
-            await message.reply_text("برنامهٔ تعویض IP دیگر فعال یا قابل استفاده نیست.")
-            return
-        if draft["target"] != row.expected and (
-            row.status != "active" or all(ip != draft["target"] for _, ip in dns_rotation.read_steps(row))
-        ):
-            await message.reply_text("این IP دیگر در برنامه نیست. دوباره از برنامهٔ تعویض IP انتخاب کن.")
-            return
+        rotation_id = draft["rotation_id"]
+        if rotation_id != replacement.DIRECT:
+            row = dns_rotation.get(ADMIN_DB, user_id, rotation_id)
+            if not row or row.status not in {"active", "done"}:
+                await message.reply_text("برنامهٔ تعویض IP دیگر فعال یا قابل استفاده نیست.")
+                return
+            if draft["target"] != row.expected and (
+                row.status != "active" or all(ip != draft["target"] for _, ip in dns_rotation.read_steps(row))
+            ):
+                await message.reply_text("این IP دیگر در برنامه نیست. دوباره از برنامهٔ تعویض IP انتخاب کن.")
+                return
         secret = SERVER_CIPHER.encrypt(json.dumps(draft["form"]).encode())
         try:
             replacement.add(
-                ADMIN_DB, user_id, row.id, draft["target"], draft["provider"], draft["account"], draft["project"],
+                ADMIN_DB, user_id, rotation_id, draft["target"], draft["provider"], draft["account"], draft["project"],
                 secret, draft["old_id"] if action == "auto" else None, host_monitor.interval(ADMIN_DB, user_id),
             )
         except sqlite3.IntegrityError:
@@ -3938,6 +3969,8 @@ async def delete_replacement_origin(rule, token):
 
 
 async def replacement_active(rule):
+    if rule.rotation_id == replacement.DIRECT:
+        return True, True
     rotation = dns_rotation.get(ADMIN_DB, rule.user_id, rule.rotation_id)
     if not rotation or rotation.status not in {"active", "done"}:
         return False, False
@@ -4162,6 +4195,9 @@ async def handle_text(update, context):
     if state.get("action") == "ssl" and "ssl_domain" not in state:
         await ssl_request_text(update, context)
         return
+    if state.get("replacement", {}).get("mode") == "enter_ip":
+        await replacement_ip_text(update, context)
+        return
     if "host_monitor" in state:
         await host_monitor_text(update, context)
         return
@@ -4315,7 +4351,7 @@ if __name__ == "__main__":
     add(CallbackQueryHandler(cancel, pattern=r"^cancel$"))
     add(CallbackQueryHandler(
         replacement_button,
-        pattern=r"^(?:replacement_list|rp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|provider:(?:hetzner|linode|kamatera|vultr|cherry)|keep|auto|list|cancel))$",
+        pattern=r"^(?:replacement_(?:list|add)|rp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|provider:(?:hetzner|linode|kamatera|vultr|cherry)|keep|auto|list|cancel))$",
     ))
     add(CallbackQueryHandler(
         host_monitor_button, pattern=r"^(?:hc:monitor|hm:[a-f0-9]{16}:(?:add|test|interval|(?:remove|page):[0-9]{1,8}))$",

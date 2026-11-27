@@ -32,7 +32,7 @@ TABLES = {
     "host_monitors": (("user_id", "i"), ("hosts", "t"), ("next_at", "i")),
     "host_monitor_settings": (("user_id", "i"), ("interval", "i")),
     "node_replacements": (
-        ("id", "i"), ("user_id", "i"), ("rotation_id", "i"), ("target", "t"), ("provider", "t"),
+        ("id", "i"), ("user_id", "i"), ("rotation_id", "n"), ("target", "t"), ("provider", "t"),
         ("account_id", "i?"), ("project_id", "i?"), ("recipe", "s?"), ("old_id", "t?"),
         ("state", "t"), ("next_at", "i"), ("remote_id", "t?"), ("deadline", "i"), ("evidence", "n"), ("note", "t"),
     ),

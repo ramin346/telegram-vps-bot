@@ -6,6 +6,7 @@ REGION_KEY = {"hetzner": "location", "kamatera": "datacenter"}
 NAME_KEY = {"hetzner": "name", "kamatera": "name", "cherry": "hostname"}
 TERMINAL = {"done", "failed", "cancelled"}
 POLL = 60
+DIRECT = 0
 
 
 class Rule(NamedTuple):
@@ -38,10 +39,11 @@ def init(db):
             )
         """)
         db.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS node_replacements_active
-            ON node_replacements(rotation_id, target)
+            CREATE UNIQUE INDEX IF NOT EXISTS node_replacements_active_by_user
+            ON node_replacements(user_id, rotation_id, target)
             WHERE state NOT IN ('done', 'failed', 'cancelled')
         """)
+        db.execute("DROP INDEX IF EXISTS node_replacements_active")
         db.execute("CREATE INDEX IF NOT EXISTS node_replacements_due ON node_replacements(state, next_at)")
 
 
