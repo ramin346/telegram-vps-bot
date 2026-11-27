@@ -4198,7 +4198,7 @@ async def replacement_button(update, context):
             draft["rule_id"] = row.id
             buttons = [[("بازگشت به فهرست", "list")]]
             if row.state == "watching":
-                buttons.insert(0, [("لغو برنامه", "cancel")])
+                buttons[:0] = [[("📡 پینگ دستی", "ping")], [("لغو برنامه", "cancel")]]
             await message.reply_text(
                 f"{row.target} · {replacement.PROVIDERS[row.provider]}\n{REPLACEMENT_STATUS[row.state]}"
                 + (f"\nشناسهٔ VPS جدید: {row.remote_id}" if row.remote_id else "") + (f"\n{row.note}" if row.note else ""),
@@ -4217,6 +4217,14 @@ async def replacement_button(update, context):
         )
     elif action == "list":
         await replacement_menu(message, draft, user_id)
+    elif action == "ping":
+        row = replacement.get(ADMIN_DB, user_id, draft["rule_id"])
+        if not row or row.state != "watching":
+            await message.reply_text("این برنامه دیگر در انتظار پایش نیست.")
+        elif row.id in REPLACEMENT_CHECKS:
+            await message.reply_text("پایش این برنامه در حال اجراست. کمی بعد دوباره بزن.")
+        else:
+            await run_replacement(context.bot, row, manual=(message, draft))
     elif action == "cancel":
         row = replacement.get(ADMIN_DB, user_id, draft["rule_id"])
         if row and row.state == "watching":
@@ -4336,32 +4344,58 @@ async def replacement_fail(bot, rule, text):
         await replacement_notify(bot, rule, text)
 
 
-async def replacement_watch(bot, rule, recipe, now):
+async def replacement_watch(bot, rule, recipe, now, *, manual=None):
+    if manual:
+        message, draft = manual
+        previous = draft.get("manual_down")
+        first = previous[1] if previous and previous[0] == rule.id else None
+        if first is not None and now < first + 120:
+            await message.reply_text(f"برای پینگ دوم حدود {first + 120 - now} ثانیه صبر کن.")
+            return
     delay = host_monitor.interval(ADMIN_DB, rule.user_id)
     try:
         active, upcoming = await replacement_active(rule)
         if not upcoming:
             replacement.update(ADMIN_DB, rule, state="cancelled", recipe=None, note="این IP دیگر در برنامه نیست.")
+            if manual:
+                await message.reply_text("این IP دیگر در برنامهٔ تعویض نیست.")
             return
         if not active:
-            replacement.update(ADMIN_DB, rule, next_at=now + delay, evidence=0)
+            if manual:
+                draft.pop("manual_down", None)
+                await message.reply_text("این IP هنوز مقصد فعال برنامهٔ تعویض نیست.")
+            else:
+                replacement.update(ADMIN_DB, rule, next_at=now + delay, evidence=0)
             return
         async with httpx.AsyncClient(timeout=8, follow_redirects=False) as client:
             networks = await host_monitor.aws_networks(client)
             status = await host_monitor.check_ip(client, rule.target, networks, minimum_timeout_nodes=2)
     except (*REPLACEMENT_ERRORS, ValueError):
         status = "unknown"
-    if status != "down" or not rule.evidence:
-        notes = {
-            "down": "حداقل دو نود ایران تایم‌اوت دادند. بررسی تأییدی حدود دو دقیقه دیگر انجام می‌شود.",
-            "ok": "در آخرین پایش دست‌کم یک نود ایران پاسخ گرفت.",
-            "aws": "IP متعلق به Amazon/AWS است و از پایش کنار گذاشته شد.",
-            "provider_unknown": "در آخرین بررسی، سرویس تشخیص ISP نتیجه نداد.",
-        }
+    notes = {
+        "down": "حداقل دو نود ایران تایم‌اوت دادند. بررسی تأییدی حدود دو دقیقه دیگر انجام می‌شود.",
+        "ok": "در آخرین پایش دست‌کم یک نود ایران پاسخ گرفت.",
+        "aws": "IP متعلق به Amazon/AWS است و از پایش کنار گذاشته شد.",
+        "provider_unknown": "در آخرین بررسی، سرویس تشخیص ISP نتیجه نداد.",
+    }
+    inconclusive = "آخرین پایش نتیجهٔ قطعی نداشت. برای جایگزینی حداقل دو تایم‌اوت لازم است."
+    if manual:
+        draft.pop("manual_down", None)
+        if status != "down":
+            await message.reply_text(notes.get(status, inconclusive))
+            return
+        if first is None or now - first > delay:
+            draft["manual_down"] = (rule.id, int(time.time()))
+            await message.reply_text(
+                "قطع پینگ یک‌بار تأیید شد. دو دقیقه بعد دوباره «پینگ دستی» را بزن. "
+                "اگر بار دوم هم قطع پینگ تأیید شود، ساخت VPS هزینه‌دار شروع می‌شود."
+            )
+            return
+    elif status != "down" or not rule.evidence:
         replacement.update(
             ADMIN_DB, rule, evidence=int(status == "down"),
             next_at=now + (120 if status == "down" else delay),
-            note=notes.get(status, "آخرین پایش نتیجهٔ قطعی نداشت. برای جایگزینی حداقل دو تایم‌اوت لازم است."),
+            note=notes.get(status, inconclusive),
         )
         return
     try:
@@ -4495,7 +4529,7 @@ async def replacement_install(bot, rule, recipe, now):
     await replacement_notify(bot, deleting, "درخواست حذف VPS قبلی ثبت شد. رکورد Cloudflare تغییر نکرد.")
 
 
-async def run_replacement(bot, rule):
+async def run_replacement(bot, rule, *, manual=None):
     if rule.id in REPLACEMENT_CHECKS:
         return
     REPLACEMENT_CHECKS.add(rule.id)
@@ -4509,7 +4543,7 @@ async def run_replacement(bot, rule):
         recipe = json.loads(SERVER_CIPHER.decrypt(rule.recipe))
         now = int(time.time())
         if rule.state == "watching":
-            await replacement_watch(bot, rule, recipe, now)
+            await replacement_watch(bot, rule, recipe, now, manual=manual)
         else:
             await replacement_install(bot, rule, recipe, now)
     except (TypeError, ValueError, InvalidToken):
@@ -4701,7 +4735,7 @@ if __name__ == "__main__":
     add(CallbackQueryHandler(cancel, pattern=r"^cancel$"))
     add(CallbackQueryHandler(
         replacement_button,
-        pattern=r"^(?:replacement_(?:list|add)|rp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|provider:(?:hetzner|linode|kamatera|vultr|cherry)|keep|auto|list|cancel))$",
+        pattern=r"^(?:replacement_(?:list|add)|rp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|provider:(?:hetzner|linode|kamatera|vultr|cherry)|keep|auto|list|cancel|ping))$",
     ))
     add(CallbackQueryHandler(
         host_monitor_button, pattern=r"^(?:hc:monitor|hm:[a-f0-9]{16}:(?:add|test|interval|(?:remove|page):[0-9]{1,8}))$",
