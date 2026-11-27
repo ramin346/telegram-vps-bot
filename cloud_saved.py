@@ -60,6 +60,10 @@ def instance_address(provider, instance):
         return public_address([(public.get(version) or {}).get("ip") for version in ("ipv4", "ipv6")])
     if provider == "vultr":
         return public_address([instance.get("main_ip"), instance.get("v6_main_ip")])
+    if provider == "cherry":
+        addresses = instance.get("ip_addresses") or []
+        primary = [entry.get("address") for entry in addresses if isinstance(entry, dict) and entry.get("type") == "primary-ip"]
+        return public_address(primary) or public_address([entry.get("address") for entry in addresses if isinstance(entry, dict)])
     return public_address([
         ip for network in instance.get("networks") or [] if isinstance(network, dict)
         for ip in network.get("ips") or []

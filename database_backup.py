@@ -27,6 +27,7 @@ TABLES = {
     "cloudflare_accounts": (("user_id", "i"), ("token", "s")),
     "cloudflare_profiles": (("id", "i"), ("user_id", "i"), ("name", "t"), ("token", "s")),
     "vultr_accounts": (("user_id", "i"), ("token", "s")),
+    "cherry_accounts": (("user_id", "i"), ("token", "s")),
     "host_monitors": (("user_id", "i"), ("hosts", "t"), ("next_at", "i")),
     "dns_rotations": (("id", "i"), ("user_id", "i"), ("zone_id", "t"), ("record_id", "t"),
                       ("name", "t"), ("kind", "t"), ("expected", "t"), ("steps", "t"),
@@ -79,7 +80,7 @@ def restore_file(data, password, storage_cipher):
     try:
         payload = password_cipher(password, data[len(MAGIC):end]).decrypt(data[end:])
         contents = json.loads(payload)
-        optional = {"cloud_saved_names", "cloud_saved_pending", "dns_rotations", "vultr_accounts", "server_folders", "server_folder_members", "host_monitors", "cloudflare_profiles"}
+        optional = {"cherry_accounts", "cloud_saved_names", "cloud_saved_pending", "dns_rotations", "vultr_accounts", "server_folders", "server_folder_members", "host_monitors", "cloudflare_profiles"}
         if not isinstance(contents, dict) or not TABLES.keys() - optional <= contents.keys() <= TABLES.keys():
             raise ValueError
         rotations = contents.get("dns_rotations", [])
@@ -96,9 +97,9 @@ def restore_file(data, password, storage_cipher):
                 raise ValueError
         for pending in rows["cloud_saved_pending"]:
             _, user_id, provider, remote, account, folder, *_rest, status = pending
-            if folders.get(folder) != user_id or provider not in {"kamatera", "hetzner", "linode", "vultr"}:
+            if folders.get(folder) != user_id or provider not in {"kamatera", "hetzner", "linode", "vultr", "cherry"}:
                 raise ValueError
-            if status not in {"pending", "failed"} or not remote or (provider in {"hetzner", "linode"} and not remote.isdecimal()):
+            if status not in {"pending", "failed"} or not remote or (provider in {"hetzner", "linode", "cherry"} and not remote.isdecimal()):
                 raise ValueError
             if provider == "hetzner" and account not in {row[0] for row in rows["hetzner_projects"] if row[1] == user_id}:
                 raise ValueError

@@ -26,6 +26,7 @@ from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters,
 )
 
+import cherry
 import cloudflare
 import cloud_saved
 import database_backup
@@ -252,6 +253,8 @@ def init_servers(db):
                 name TEXT COLLATE NOCASE NOT NULL, token BLOB NOT NULL, UNIQUE (user_id, name)
             )
         """)
+    with db:
+        db.execute("CREATE TABLE IF NOT EXISTS cherry_accounts (user_id INTEGER PRIMARY KEY, token BLOB NOT NULL)")
     cloud_saved.init(db)
     dns_rotation.init(db)
     host_monitor.init(db)
@@ -263,6 +266,7 @@ def init_servers(db):
         UNION ALL SELECT 1 FROM cloudflare_accounts
         UNION ALL SELECT 1 FROM cloudflare_profiles
         UNION ALL SELECT 1 FROM vultr_accounts
+        UNION ALL SELECT 1 FROM cherry_accounts
         UNION ALL SELECT 1 FROM cloud_saved_pending WHERE secret IS NOT NULL LIMIT 1
     """).fetchone()
     if not key_path.exists() and not has_saved_secrets:
@@ -336,7 +340,8 @@ def menu(owner):
          InlineKeyboardButton("☁️ سرور Linode", callback_data="linode")],
         [InlineKeyboardButton("☁️ سرور هتزنر", callback_data="hetzner"),
          InlineKeyboardButton("☁️ سرور Vultr", callback_data="vultr")],
-        [InlineKeyboardButton("🌐 Cloudflare", callback_data="cloudflare")],
+        [InlineKeyboardButton("🌐 Cloudflare", callback_data="cloudflare"),
+         InlineKeyboardButton("🍒 سرور Cherry", callback_data="cherry")],
     ])
     if owner:
         rows.append([InlineKeyboardButton("👑 پنل مدیریت", callback_data="license_panel")])
@@ -1012,12 +1017,17 @@ async def resolve_created_server(pending):
             token = vultr_token(user_id)
             if token:
                 instance = await vultr.details(token, pending.remote_id)
-    except (kamatera.APIError, linode.APIError, hetzner.APIError, vultr.APIError, InvalidToken):
+        elif pending.provider == "cherry":
+            token = cherry_token(user_id)
+            if token:
+                instance = await cherry.details(token, int(pending.remote_id))
+                failed = instance.get("status") == "failed deployment"
+    except (kamatera.APIError, linode.APIError, hetzner.APIError, vultr.APIError, cherry.APIError, InvalidToken):
         pass
     address = cloud_saved.instance_address(pending.provider, instance) if instance else None
     secret = None
-    if address and pending.provider == "vultr":
-        password = instance.get("default_password")
+    if address and pending.provider in {"vultr", "cherry"}:
+        password = instance.get("password" if pending.provider == "cherry" else "default_password")
         if isinstance(password, str) and password:
             secret = SERVER_CIPHER.encrypt(password.encode())
     if not user_has_access(user_id):
@@ -2845,7 +2855,7 @@ async def backup_text(update, context):
     await message.reply_text(
         f"بکاپ خوانده شد: {len(rows['servers'])} سرور ذخیره‌شده، "
         f"{len(rows['admins'])} ادمین اضافه‌شده و "
-        f"{sum(len(rows[name]) for name in ('kamatera_accounts', 'linode_accounts', 'hetzner_projects', 'cloudflare_accounts', 'cloudflare_profiles', 'vultr_accounts'))} حساب سرویس.\n"
+        f"{sum(len(rows[name]) for name in ('kamatera_accounts', 'linode_accounts', 'hetzner_projects', 'cloudflare_accounts', 'cloudflare_profiles', 'vultr_accounts', 'cherry_accounts'))} حساب سرویس.\n"
         "با تأیید، اطلاعات ذخیره‌شدهٔ فعلی ربات با اطلاعات این فایل جایگزین می‌شود.",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("تأیید جایگزینی دیتابیس", callback_data=confirmation)],
@@ -3325,6 +3335,269 @@ async def host_monitor_job(context):
     await asyncio.gather(*runs)
 
 
+CHERRY_PROMPTS = {
+    "team": "تیم Cherry Servers را انتخاب کن.",
+    "project": "پروژه را انتخاب کن.",
+    "region": "دیتاسنتر را انتخاب کن.",
+    "plan": "یک پلن مجازی موجود را انتخاب کن.",
+    "image": "سیستم‌عامل را انتخاب کن.",
+    "cycle": "دورهٔ پرداخت را انتخاب کن.",
+    "servers": "سرور پروژه را انتخاب کن.",
+}
+CHERRY_OPERATIONS = {**cherry.POWER, "delete": "حذف دائمی"}
+
+
+def cherry_token(user_id):
+    row = ADMIN_DB.execute("SELECT token FROM cherry_accounts WHERE user_id = ?", (user_id,)).fetchone()
+    return SERVER_CIPHER.decrypt(row[0]).decode() if row else None
+
+
+def cherry_keyboard(state, rows):
+    return nonce_keyboard(state, rows, "chp")
+
+
+async def cherry_picker(message, state, page=0):
+    await show_cloud_picker(message, state, page, CHERRY_PROMPTS[state["step"]], "chp", "منوی Cherry Servers", "cherry")
+
+
+def cherry_price_label(cycle, price):
+    period = "ساعتی" if cycle == "hourly" else "ماهانه"
+    tax = "با مالیات" if price.get("taxed") else "بدون مالیات"
+    return f"{period}: {price['price']:g} {price['currency']} · {tax}"
+
+
+async def show_cherry_server(message, state, token):
+    server = await cherry.details(token, state["instance"])
+    state.update(step="instance", label=str(server.get("hostname") or server.get("name") or server["id"])[:120])
+    addresses = [
+        entry["address"] for entry in server.get("ip_addresses") or []
+        if isinstance(entry, dict) and isinstance(entry.get("address"), str)
+    ]
+    region = server.get("region") or {}
+    await message.reply_text(
+        f"سرور: {state['label']}\nوضعیت: {server.get('status') or server.get('state') or '—'}\n"
+        f"دیتاسنتر: {region.get('location') or region.get('slug') or '—'}\nIP: {', '.join(addresses)[:1500] or '—'}",
+        reply_markup=cherry_keyboard(state, [
+            [(caption, action) for action, caption in cherry.POWER.items()],
+            [("🔑 رمز اولیه", "password"), ("🗑 حذف سرور", "delete")],
+            [("🔄 تازه‌سازی", "refresh"), ("بازگشت به فهرست", "list")],
+        ]),
+    )
+
+
+async def show_cherry_password(message, state, server, title):
+    password = server.get("password")
+    keyboard = list(cherry_keyboard(state, [[("جزئیات سرور", "refresh"), ("سرورهای پروژه", "list")]]).inline_keyboard)
+    if isinstance(password, str) and password:
+        title += f"\n\nکاربر: {server.get('username') or 'root'}\nرمز اولیه:\n{password}"
+        if len(password) <= 256:
+            keyboard.insert(0, [InlineKeyboardButton("کپی رمز", copy_text=CopyTextButton(password))])
+    else:
+        title += "\nAPI هنوز رمز اولیه‌ای برنگردانده است. بعد از آماده‌شدن سرور می‌توانی دوباره بررسی کنی."
+    await message.reply_text(title, protect_content=bool(password), reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def cherry_button(update, context):
+    query = update.callback_query
+    if not private_admin(update):
+        await query.answer()
+        return
+    user_id = update.effective_user.id
+    message = query.message
+    state = context.user_data.get("cherry", {})
+    action = query.data
+    if action.startswith("chp:"):
+        _, nonce, action = action.split(":", 2)
+        if nonce != state.get("nonce"):
+            await query.answer("این منو بسته شده است.")
+            return
+    else:
+        clear(context)
+        state = context.user_data["cherry"] = {}
+    await query.answer()
+    if action == "cherry":
+        await message.reply_text("مدیریت Cherry Servers", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔑 ثبت یا تعویض توکن API", callback_data="ch:key")],
+            [InlineKeyboardButton("➕ ساخت VPS", callback_data="ch:new"),
+             InlineKeyboardButton("🖥 سرورهای موجود", callback_data="ch:servers")],
+        ]))
+        return
+    if action == "ch:key":
+        state["step"] = "key"
+        await message.reply_text("توکن API پنل Cherry Servers را بفرست. ربات تلاش می‌کند پیام توکن را حذف کند.")
+        return
+    try:
+        token = cherry_token(user_id)
+    except InvalidToken:
+        token = None
+    if not token:
+        await message.reply_text("ابتدا توکن Cherry Servers را ثبت کن.")
+        return
+    try:
+        if action in {"ch:new", "ch:servers"}:
+            teams = await cherry.catalog("/teams", token)
+            state.update(step="team", mode=action, form={}, choices=[
+                (row["id"], str(row.get("name") or row["id"])) for row in teams
+            ])
+            await cherry_picker(message, state)
+        elif action.startswith(("pick:", "page:")):
+            verb, raw = action.split(":")
+            index = int(raw)
+            if verb == "page":
+                if index * 8 < len(state["choices"]):
+                    await cherry_picker(message, state, index)
+            elif index < len(state["choices"]):
+                await cherry_pick(message, state, token, index)
+        elif action == "list":
+            await cherry_list_servers(message, state, token)
+        elif action == "refresh":
+            await show_cherry_server(message, state, token)
+        elif action == "password":
+            server = await cherry.details(token, state["instance"])
+            await show_cherry_password(message, state, server, f"سرور: {state['label']}")
+        elif action in CHERRY_OPERATIONS and state["step"] == "instance":
+            state.update(step="operation_confirm", operation=action)
+            text = f"«{CHERRY_OPERATIONS[action]}» برای سرور «{state['label']}» با شناسهٔ {state['instance']} انجام شود؟"
+            if action == "delete":
+                text += "\nسرور و داده‌های روی دیسک آن برای همیشه حذف می‌شوند."
+            await message.reply_text(text, reply_markup=cherry_keyboard(state, [[("تأیید", "confirm"), ("انصراف", "refresh")]]))
+        elif action == "confirm":
+            await cherry_confirm(message, state, token, user_id)
+    except cherry.APIError as exc:
+        text = "درخواست Cherry Servers ناموفق بود."
+        if action == "confirm" and (exc.status is None or exc.status >= 500):
+            text = "نتیجهٔ درخواست مشخص نیست. قبل از تکرار، فهرست سرورها یا پنل Cherry Servers را بررسی کن."
+        elif exc.status:
+            text += f" HTTP {exc.status}"
+        await message.reply_text(text)
+
+
+async def cherry_list_servers(message, state, token):
+    rows = await cherry.catalog(f"/projects/{state['project']}/servers", token)
+    state.update(step="servers", choices=[
+        (row["id"], f"{row.get('hostname') or row.get('name') or row['id']} · {row.get('status', '—')}") for row in rows
+    ])
+    await cherry_picker(message, state)
+
+
+async def cherry_pick(message, state, token, index):
+    value, label = state["choices"][index]
+    step = state["step"]
+    form = state["form"]
+    if step == "team":
+        projects = await cherry.catalog(f"/teams/{int(value)}/projects", token)
+        state.update(team=int(value), step="project", choices=[
+            (row["id"], str(row.get("name") or row["id"])) for row in projects
+        ])
+    elif step == "project":
+        state.update(project=int(value), project_name=label)
+        if state["mode"] == "ch:servers":
+            await cherry_list_servers(message, state, token)
+            return
+        regions = await cherry.catalog("/regions", token)
+        state.update(step="region", choices=[
+            (row["slug"], f"{row.get('location') or row.get('name') or row['slug']} · {row['slug']}") for row in regions
+        ])
+    elif step == "region":
+        plans = await cherry.plans(token, state["team"], value)
+        if not plans:
+            await message.reply_text("این دیتاسنتر پلن مجازی با قیمت قابل نمایش ندارد. منطقهٔ دیگری را انتخاب کن.")
+            return
+        form["region"] = value
+        state.update(step="plan", choices=[(row, str(row.get("name") or row["slug"])) for row in plans])
+    elif step == "plan":
+        images = await cherry.images(token, state["team"], value["slug"])
+        if not images:
+            await message.reply_text("ایمیج لینوکسی بدون هزینهٔ جداگانه پیدا نشد. پلن دیگری را انتخاب کن.")
+            return
+        form["plan"] = value["slug"]
+        state.update(step="image", plan_prices=cherry.prices(value), plan_label=label, choices=[
+            (row["slug"], str(row.get("name") or row["slug"])) for row in images
+        ])
+    elif step == "image":
+        form["image"] = value
+        state.update(step="cycle", image_label=label, choices=[
+            (cycle, cherry_price_label(cycle, price)) for cycle, price in state["plan_prices"].items()
+        ])
+    elif step == "cycle":
+        form["cycle"] = value
+        state.update(step="name", price_label=label)
+        state.pop("nonce", None)
+        await message.reply_text("نام VPS را بفرست. برای لغو /cancel را بزن.")
+        return
+    elif step == "servers":
+        state["instance"] = value
+        await show_cherry_server(message, state, token)
+        return
+    await cherry_picker(message, state)
+
+
+async def cherry_confirm(message, state, token, user_id):
+    state.pop("nonce", None)
+    if state["step"] == "create_confirm":
+        form = state["form"]
+        server = await cherry.create(token, state["project"], form)
+        storage = store_created_server(
+            user_id, "cherry", server["id"], form["region"], form["hostname"], instance=server,
+            password=server.get("password"), username=server.get("username") or "root",
+        )
+        state.update(step="instance", instance=server["id"], label=form["hostname"])
+        await show_cherry_password(message, state, server, f"درخواست ساخت VPS ثبت شد. شناسه: {server['id']}\n{storage}")
+        return
+    operation = state["operation"]
+    await cherry.change_server(token, state["instance"], operation)
+    if operation == "delete":
+        rows = [[("بازگشت به فهرست", "list")]]
+        title = "درخواست حذف VPS ثبت شد."
+    else:
+        rows = [[("🔄 تازه‌سازی وضعیت", "refresh"), ("بازگشت به فهرست", "list")]]
+        title = "درخواست تغییر وضعیت ثبت شد."
+    await message.reply_text(title, reply_markup=cherry_keyboard(state, rows))
+
+
+async def cherry_text(update, context):
+    message = update.message
+    state = context.user_data["cherry"]
+    value = message.text.strip()
+    if state.get("step") == "key":
+        await delete_secret_message(message)
+        value = re.sub(r"^Bearer\s+", "", value, flags=re.IGNORECASE)
+        if not re.fullmatch(r"[A-Za-z0-9._~+/=\-]{16,4096}", value):
+            await message.reply_text("مقدار کامل توکن را در یک خط بفرست.")
+            return
+        try:
+            result = await cherry.request("GET", "/teams", value, params={"limit": 1})
+            if not isinstance(result, list):
+                raise cherry.APIError()
+        except cherry.APIError as exc:
+            suffix = f" (HTTP {exc.status})" if exc.status else ""
+            await message.reply_text(f"توکن تأیید نشد. دسترسی توکن به تیم‌ها را بررسی کن.{suffix}")
+            return
+        with ADMIN_DB:
+            ADMIN_DB.execute(
+                "INSERT INTO cherry_accounts VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET token=excluded.token",
+                (update.effective_user.id, SERVER_CIPHER.encrypt(value.encode())),
+            )
+        clear(context)
+        await message.reply_text("توکن Cherry Servers تأیید و رمزگذاری شد.", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("منوی Cherry Servers", callback_data="cherry")],
+        ]))
+    elif state.get("step") == "name":
+        if len(value) > 63 or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?", value):
+            await message.reply_text("نام VPS را با حروف انگلیسی، عدد و خط تیره بفرست. با خط تیره شروع یا تمام نشود.")
+            return
+        form = state["form"]
+        form["hostname"] = value
+        state["step"] = "create_confirm"
+        await message.reply_text(
+            f"نام: {value}\nپروژه: {state['project_name']}\nدیتاسنتر: {form['region']}\n"
+            f"سیستم‌عامل: {state['image_label']}\nپلن: {state['plan_label']}\nقیمت پلن: {state['price_label']}",
+            reply_markup=cherry_keyboard(state, [[("✅ تأیید ساخت و هزینه", "confirm")]]),
+        )
+    else:
+        await message.reply_text("از دکمه‌های همین مرحله استفاده کن یا /cancel را بزن.")
+
+
 async def handle_text(update, context):
     if not private_admin(update):
         return
@@ -3341,6 +3614,9 @@ async def handle_text(update, context):
         return
     if state.get("folder_pending"):
         await create_server_folder(update, context)
+        return
+    if "cherry" in state:
+        await cherry_text(update, context)
         return
     if "vultr" in state:
         await vultr_text(update, context)
@@ -3488,6 +3764,10 @@ if __name__ == "__main__":
         host_check_button, pattern=r"^(?:host_checks|hc:(?:ping|info))$",
     ))
     add(CallbackQueryHandler(select, pattern=r"^(ssh|node|ssl|on|off|update)$"))
+    add(CallbackQueryHandler(
+        cherry_button,
+        pattern=r"^(?:cherry|ch:(?:key|new|servers)|chp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|power-on|power-off|reboot|delete|password|refresh|list|confirm))$",
+    ))
     add(CallbackQueryHandler(
         vultr_button,
         pattern=r"^(?:vultr|vu:(?:key|new|list)|vp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|start|halt|reboot|delete|password|refresh|list|confirm))$",
