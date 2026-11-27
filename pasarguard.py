@@ -72,10 +72,13 @@ class Panel:
         self.host = host
         self.hostname = hostname
         self.token = None
+        self.api_key = None
 
     async def request(self, method, path, **kwargs):
         headers = {"Host": self.host}
-        if self.token:
+        if self.api_key:
+            headers["X-Api-Key"] = self.api_key
+        elif self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         try:
             response = await self.client.request(
@@ -85,7 +88,15 @@ class Panel:
             response.raise_for_status()
             return response.json() if response.content else None
         except httpx.HTTPStatusError as exc:
-            raise PanelError(f"پنل پاسارگارد خطای HTTP {exc.response.status_code} داد.") from None
+            status = exc.response.status_code
+            if status == 404 and path in {"cores", "admin/token"}:
+                raise PanelError(
+                    f"مسیر /api/{path} در این آدرس پیدا نشد (HTTP 404). "
+                    "آدرس ورود پنل، پورت و مسیر پراکسی معکوس را بررسی کن."
+                ) from None
+            if status == 403 and path == "cores":
+                raise PanelError("کلید به خواندن Core دسترسی ندارد (HTTP 403). مجوز cores:read را در پنل بررسی کن.") from None
+            raise PanelError(f"پنل پاسارگارد خطای HTTP {status} داد.") from None
         except (httpx.RequestError, ValueError):
             raise PanelError("ارتباط امن با پنل پاسارگارد برقرار نشد یا پاسخ پنل معتبر نبود.") from None
 
@@ -139,10 +150,16 @@ def parse_url(value):
     try:
         url = urlsplit(value)
         if (url.scheme != "https" or not url.hostname or url.username is not None
-                or url.query or url.fragment or not re.fullmatch(r"[A-Za-z0-9.:-]+", url.hostname)
+                or not re.fullmatch(r"[A-Za-z0-9.:-]+", url.hostname)
                 or not re.fullmatch(r"(?:/[A-Za-z0-9_-]+)*/?", url.path)):
             raise ValueError
-        return url, url.port or 443
+        dashboard = re.search(r"/dashboard(?:/|$)", url.path)
+        if dashboard:
+            url = url._replace(path=url.path[:dashboard.start()], query="", fragment="")
+        elif url.query or url.fragment:
+            raise ValueError
+        path = url.path.rstrip("/").removesuffix("/api")
+        return url._replace(path=path), url.port or 443
     except ValueError:
         raise PanelError("آدرس پنل باید یک آدرس HTTPS معتبر باشد.") from None
 
@@ -164,7 +181,11 @@ async def connect(url_text, credentials):
     async with httpx.AsyncClient(timeout=20, trust_env=False) as client:
         panel = Panel(client, f"https://{address}:{port}{url.path.rstrip('/')}", url.netloc, url.hostname)
         if len(credentials) == 1:
-            panel.token = credentials[0]
+            credential = credentials[0]
+            if credential.startswith("pg_key_"):
+                panel.api_key = credential
+            else:
+                panel.token = credential
         else:
             result = await panel.request(
                 "POST", "admin/token", data={"username": credentials[0], "password": credentials[1]},

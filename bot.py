@@ -1732,10 +1732,9 @@ async def panel_credentials_text(update, context):
         if len(values) not in (2, 3) or not all(line.strip() for line in values):
             raise pasarguard.PanelError("آدرس و توکن را در دو خط یا آدرس، نام کاربری و رمز را در سه خط بفرست.")
         url, *credentials = (line.strip() for line in values)
-        url = url.rstrip("/")
         async with pasarguard.connect(url, credentials) as panel:
             await panel.cores()
-        pasarguard.save_account(ADMIN_DB, SERVER_CIPHER, update.effective_user.id, url, credentials)
+        pasarguard.save_account(ADMIN_DB, SERVER_CIPHER, update.effective_user.id, url.rstrip("/"), credentials)
     except (pasarguard.PanelError, KeyError, TypeError) as error:
         await message.reply_text(str(error) if isinstance(error, pasarguard.PanelError) else "پاسخ API پنل معتبر نبود.")
         return
@@ -1764,7 +1763,7 @@ async def panel_button(update, context):
             else:
                 context.user_data["pasarguard"] = {"step": "credentials"}
                 await message.reply_text(
-                    "آدرس HTTPS پنل و توکن دسترسی را در دو خط بفرست. "
+                    "آدرس HTTPS پنل و کلید API یا توکن دسترسی را در دو خط بفرست. "
                     "برای ورود خودکار می‌توانی آدرس، نام کاربری و رمز پنل را در سه خط بفرستی."
                 )
             return
