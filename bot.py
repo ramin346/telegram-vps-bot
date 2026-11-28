@@ -1965,30 +1965,70 @@ async def show_panel_host_confirmation(message, user_id, ticket, draft, inbound)
     pasarguard.update_install(ADMIN_DB, SERVER_CIPHER, user_id, ticket, draft)
     rows = [[InlineKeyboardButton("✅ ثبت نود و Host", callback_data=f"pg:confirm:{ticket}:{nonce}")]]
     if not draft.get("started"):
-        rows.append([InlineKeyboardButton("✏️ تغییر اسم Host", callback_data=f"pg:rename:{ticket}")])
+        rows.append([
+            InlineKeyboardButton("✏️ تغییر اسم", callback_data=f"pg:rename:{ticket}"),
+            InlineKeyboardButton("🌐 تغییر آدرس", callback_data=f"pg:address:{ticket}"),
+        ])
     await message.reply_text(
-        f"نود {draft['node']['name']} و Host «{draft['remark']}» با همین IP روی اینباند {inbound} ثبت شوند؟",
+        f"نود: {draft['node']['address']}\n"
+        f"نام Host: {draft['remark']}\nآدرس Host: {draft['host_address']}\n"
+        f"اینباند: {inbound}\nثبت شود؟",
         reply_markup=InlineKeyboardMarkup(rows),
     )
 
 
-async def panel_host_name_text(update, context):
+async def ask_panel_host_address(message, state, user_id, ticket, draft):
+    draft.pop("confirm_nonce", None)
+    pasarguard.update_install(ADMIN_DB, SERVER_CIPHER, user_id, ticket, draft)
+    state.update(step="host_address", ticket=ticket)
+    ip = draft["node"]["address"]
+    await message.reply_text(
+        "آدرس Host رو انتخاب کن. برای تونل، IP یا ساب‌دامنهٔ دیگه رو همین‌جا بفرست.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"🌐 استفاده از IP نود ({ip})", callback_data=f"pg:nodeip:{ticket}"),
+        ]]),
+    )
+
+
+def parse_panel_host_address(value):
+    if "%" in value:
+        raise ValueError
+    try:
+        return str(ip_address(value))
+    except ValueError:
+        return ssl_domain(value)
+
+
+async def panel_host_text(update, context):
     state = context.user_data["pasarguard"]
     user_id = update.effective_user.id
     message = update.message
-    remark = message.text.strip()
-    if not 1 <= len(remark) <= 256 or any(ord(char) < 32 or ord(char) == 127 for char in remark):
-        await message.reply_text("اسم Host را در یک خط، حداکثر ۲۵۶ کاراکتر بفرست. مثلاً 🇩🇪 آلمان ۱")
-        return
+    value = message.text.strip()
+    entering_name = state["step"] == "host_name"
+    if entering_name:
+        if not 1 <= len(value) <= 256 or any(ord(char) < 32 or ord(char) == 127 for char in value):
+            await message.reply_text("اسم Host را در یک خط، حداکثر ۲۵۶ کاراکتر بفرست. مثلاً 🇩🇪 آلمان ۱")
+            return
+    else:
+        try:
+            value = parse_panel_host_address(value)
+        except ValueError:
+            await message.reply_text("یک IPv4، IPv6 یا ساب‌دامنه بفرست. مثلاً tunnel.example.com")
+            return
     try:
         ticket = state["ticket"]
         draft = pasarguard.load_install(ADMIN_DB, SERVER_CIPHER, user_id, ticket)
         url, _, core_id, inbound = pasarguard.account(ADMIN_DB, SERVER_CIPHER, user_id)
         if draft.get("completed") or draft.get("started") or draft.get("target") != [url, core_id, inbound]:
             raise pasarguard.PanelError("این مرحله دیگر فعال نیست. دوباره دکمهٔ اضافه‌کردن به پنل را بزن.")
-        draft["remark"] = remark
-        clear(context)
-        await show_panel_host_confirmation(message, user_id, ticket, draft, inbound)
+        if entering_name:
+            draft["remark"] = value
+            draft.pop("host_address", None)
+            await ask_panel_host_address(message, state, user_id, ticket, draft)
+        else:
+            draft["host_address"] = value
+            clear(context)
+            await show_panel_host_confirmation(message, user_id, ticket, draft, inbound)
     except (pasarguard.PanelError, InvalidToken) as error:
         clear(context)
         await message.reply_text(
@@ -2028,10 +2068,10 @@ async def panel_button(update, context):
                     message, state, int(selection.split(":")[1]), state["prompt"], "pgp", "🛡 منوی پاسارگارد", "pg",
                 )
                 return
-        else:
+        elif not action.startswith("pg:nodeip:"):
             clear(context)
             state = context.user_data["pasarguard"] = {"url": url}
-        if action.startswith(("pg:add:", "pg:rename:", "pg:confirm:")):
+        if action.startswith(("pg:add:", "pg:rename:", "pg:address:", "pg:nodeip:", "pg:confirm:")):
             if not inbound or core_id is None:
                 raise pasarguard.PanelError("ابتدا Core و اینباند پیش‌فرض Host را انتخاب کن.")
             _, operation, ticket, *confirmation = action.split(":")
@@ -2043,13 +2083,24 @@ async def panel_button(update, context):
             if draft.get("completed"):
                 await message.reply_text(f"نود و Host {draft['remark']} قبلاً ثبت شده‌اند.")
                 return
-            if operation != "confirm" or not draft.get("remark") or not confirmation:
+            if operation == "nodeip":
+                if state.get("step") != "host_address" or state.get("ticket") != ticket or draft.get("started"):
+                    raise pasarguard.PanelError("این دکمه قدیمی است. مرحلهٔ انتخاب آدرس Host را دوباره باز کن.")
+                draft["host_address"] = node["address"]
+                clear(context)
+                await show_panel_host_confirmation(message, user_id, ticket, draft, inbound)
+                return
+            if draft.get("started") and not draft.get("host_address"):
+                draft["host_address"] = node["address"]
+            if operation != "confirm" or not draft.get("remark") or not draft.get("host_address") or not confirmation:
                 draft["target"] = target
                 if (operation == "rename" or not draft.get("remark")) and not draft.get("started"):
                     draft.pop("confirm_nonce", None)
                     pasarguard.update_install(ADMIN_DB, SERVER_CIPHER, user_id, ticket, draft)
                     state.update(step="host_name", ticket=ticket)
                     await message.reply_text("اسم دلخواه Host رو بفرست. پرچم و ایموجی هم می‌تونی بذاری. مثلاً 🇩🇪 آلمان ۱")
+                elif not draft.get("started") and (operation == "address" or not draft.get("host_address")):
+                    await ask_panel_host_address(message, state, user_id, ticket, draft)
                 else:
                     await show_panel_host_confirmation(message, user_id, ticket, draft, inbound)
                 return
@@ -2059,12 +2110,12 @@ async def panel_button(update, context):
                 if inbound not in await panel.inbounds(core_id):
                     raise pasarguard.PanelError("اینباند پیش‌فرض دیگر روی Core انتخابی در دسترس نیست.")
                 hosts = await panel.hosts()
-                panel.host_exists(draft["remark"], node["address"], inbound, hosts)
+                panel.host_exists(draft["remark"], draft["host_address"], inbound, hosts)
                 await panel.ensure_node(dict(node, core_config_id=core_id))
                 draft["started"] = True
                 pasarguard.update_install(ADMIN_DB, SERVER_CIPHER, user_id, ticket, draft)
                 try:
-                    await panel.ensure_host(draft["remark"], node["address"], inbound, hosts)
+                    await panel.ensure_host(draft["remark"], draft["host_address"], inbound, hosts)
                 except pasarguard.PanelError as error:
                     raise pasarguard.PanelError(
                         f"نود در پنل ثبت شده، اما ثبت Host کامل نشد. {error} برای تلاش دوباره همان دکمهٔ ثبت را بزن."
@@ -4825,8 +4876,8 @@ async def handle_text(update, context):
     if state.get("panel_install_step") in {"domain", "email", "confirm"}:
         await panel_install_text(update, context)
         return
-    if state.get("pasarguard", {}).get("step") == "host_name":
-        await panel_host_name_text(update, context)
+    if state.get("pasarguard", {}).get("step") in {"host_name", "host_address"}:
+        await panel_host_text(update, context)
         return
     if state.get("pasarguard", {}).get("step") == "credentials":
         await panel_credentials_text(update, context)
@@ -5008,7 +5059,7 @@ if __name__ == "__main__":
     add(CallbackQueryHandler(select, pattern=r"^(ssh|node|ssl|on|off|update)$"))
     add(CallbackQueryHandler(
         panel_button,
-        pattern=r"^(?:pg|pg:(?:key|default|hosts|(?:add|rename):[a-f0-9]{24}|confirm:[a-f0-9]{24}(?::[a-f0-9]{16})?)|pgp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|confirm))$",
+        pattern=r"^(?:pg|pg:(?:key|default|hosts|(?:add|rename|address|nodeip):[a-f0-9]{24}|confirm:[a-f0-9]{24}(?::[a-f0-9]{16})?)|pgp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|confirm))$",
     ))
     add(CallbackQueryHandler(
         cherry_button,
