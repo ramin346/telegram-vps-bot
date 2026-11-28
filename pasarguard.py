@@ -135,12 +135,18 @@ class Panel:
     async def hosts(self):
         return await self.request("GET", "hosts")
 
-    async def ensure_host(self, remark, ip, inbound, hosts):
+    @staticmethod
+    def host_exists(remark, ip, inbound, hosts):
         for host in hosts:
             if host["remark"] == remark:
                 if host["inbound_tag"] == inbound and set(host["address"]) == {ip}:
-                    return
-                raise PanelError(f"نام {remark} در پنل برای Host دیگری استفاده شده است.")
+                    return True
+                raise PanelError(f"اسم «{remark}» قبلاً برای Host دیگری استفاده شده است. اسم دیگری انتخاب کن.")
+        return False
+
+    async def ensure_host(self, remark, ip, inbound, hosts):
+        if self.host_exists(remark, ip, inbound, hosts):
+            return
         await self.request("POST", "host/", json={
             "remark": remark, "address": [ip], "inbound_tag": inbound, "priority": 0,
         })
@@ -214,14 +220,3 @@ def account(db, cipher, user_id):
         raise PanelError("ابتدا اتصال پنل را در بخش پاسارگارد تنظیم کن.")
     url, encrypted, core_id, inbound = row
     return url, json.loads(cipher.decrypt(encrypted)), core_id, inbound
-
-
-def reserve_remark(db, user_id, hosts):
-    numbers = [int(match[1]) for host in hosts if (match := re.fullmatch(r"HERM([0-9]{1,18})", host["remark"], re.I))]
-    with db:
-        number = db.execute(
-            "SELECT next_number FROM pasarguard_accounts WHERE user_id = ?", (user_id,),
-        ).fetchone()[0]
-        number = max(number, max(numbers, default=0) + 1)
-        db.execute("UPDATE pasarguard_accounts SET next_number = ? WHERE user_id = ?", (number + 1, user_id))
-    return f"HERM{number}"

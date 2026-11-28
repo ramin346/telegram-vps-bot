@@ -1960,6 +1960,43 @@ async def panel_picker(message, state, step, choices, prompt):
     await show_cloud_picker(message, state, 0, prompt, "pgp", "🛡 منوی پاسارگارد", "pg")
 
 
+async def show_panel_host_confirmation(message, user_id, ticket, draft, inbound):
+    nonce = draft["confirm_nonce"] = secrets.token_hex(8)
+    pasarguard.update_install(ADMIN_DB, SERVER_CIPHER, user_id, ticket, draft)
+    rows = [[InlineKeyboardButton("✅ ثبت نود و Host", callback_data=f"pg:confirm:{ticket}:{nonce}")]]
+    if not draft.get("started"):
+        rows.append([InlineKeyboardButton("✏️ تغییر اسم Host", callback_data=f"pg:rename:{ticket}")])
+    await message.reply_text(
+        f"نود {draft['node']['name']} و Host «{draft['remark']}» با همین IP روی اینباند {inbound} ثبت شوند؟",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def panel_host_name_text(update, context):
+    state = context.user_data["pasarguard"]
+    user_id = update.effective_user.id
+    message = update.message
+    remark = message.text.strip()
+    if not 1 <= len(remark) <= 256 or any(ord(char) < 32 or ord(char) == 127 for char in remark):
+        await message.reply_text("اسم Host را در یک خط، حداکثر ۲۵۶ کاراکتر بفرست. مثلاً 🇩🇪 آلمان ۱")
+        return
+    try:
+        ticket = state["ticket"]
+        draft = pasarguard.load_install(ADMIN_DB, SERVER_CIPHER, user_id, ticket)
+        url, _, core_id, inbound = pasarguard.account(ADMIN_DB, SERVER_CIPHER, user_id)
+        if draft.get("completed") or draft.get("started") or draft.get("target") != [url, core_id, inbound]:
+            raise pasarguard.PanelError("این مرحله دیگر فعال نیست. دوباره دکمهٔ اضافه‌کردن به پنل را بزن.")
+        draft["remark"] = remark
+        clear(context)
+        await show_panel_host_confirmation(message, user_id, ticket, draft, inbound)
+    except (pasarguard.PanelError, InvalidToken) as error:
+        clear(context)
+        await message.reply_text(
+            str(error) if isinstance(error, pasarguard.PanelError) else "اطلاعات ثبت نود خوانده نشد.",
+            reply_markup=panel_menu(),
+        )
+
+
 async def panel_button(update, context):
     query = update.callback_query
     await query.answer()
@@ -1994,10 +2031,10 @@ async def panel_button(update, context):
         else:
             clear(context)
             state = context.user_data["pasarguard"] = {"url": url}
-        if action.startswith(("pg:add:", "pg:confirm:")):
+        if action.startswith(("pg:add:", "pg:rename:", "pg:confirm:")):
             if not inbound or core_id is None:
                 raise pasarguard.PanelError("ابتدا Core و اینباند پیش‌فرض Host را انتخاب کن.")
-            ticket = action.split(":")[2]
+            _, operation, ticket, *confirmation = action.split(":")
             draft = pasarguard.load_install(ADMIN_DB, SERVER_CIPHER, user_id, ticket)
             node = draft["node"]
             target = [url, core_id, inbound]
@@ -2006,25 +2043,26 @@ async def panel_button(update, context):
             if draft.get("completed"):
                 await message.reply_text(f"نود و Host {draft['remark']} قبلاً ثبت شده‌اند.")
                 return
-            if action.startswith("pg:add:"):
-                if "target" not in draft:
-                    draft["target"] = target
+            if operation != "confirm" or not draft.get("remark") or not confirmation:
+                draft["target"] = target
+                if (operation == "rename" or not draft.get("remark")) and not draft.get("started"):
+                    draft.pop("confirm_nonce", None)
                     pasarguard.update_install(ADMIN_DB, SERVER_CIPHER, user_id, ticket, draft)
-                await message.reply_text(
-                    f"نود {node['name']} و یک Host با همین IP روی اینباند {inbound} ثبت شود؟",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("✅ ثبت نود و Host", callback_data=f"pg:confirm:{ticket}"),
-                    ]]),
-                )
+                    state.update(step="host_name", ticket=ticket)
+                    await message.reply_text("اسم دلخواه Host رو بفرست. پرچم و ایموجی هم می‌تونی بذاری. مثلاً 🇩🇪 آلمان ۱")
+                else:
+                    await show_panel_host_confirmation(message, user_id, ticket, draft, inbound)
                 return
+            if confirmation[0] != draft.get("confirm_nonce"):
+                raise pasarguard.PanelError("این تأیید قدیمی است. دوباره دکمهٔ اضافه‌کردن به پنل را بزن.")
             async with pasarguard.connect(url, credentials) as panel:
                 if inbound not in await panel.inbounds(core_id):
                     raise pasarguard.PanelError("اینباند پیش‌فرض دیگر روی Core انتخابی در دسترس نیست.")
                 hosts = await panel.hosts()
+                panel.host_exists(draft["remark"], node["address"], inbound, hosts)
                 await panel.ensure_node(dict(node, core_config_id=core_id))
-                if "remark" not in draft:
-                    draft["remark"] = pasarguard.reserve_remark(ADMIN_DB, user_id, hosts)
-                    pasarguard.update_install(ADMIN_DB, SERVER_CIPHER, user_id, ticket, draft)
+                draft["started"] = True
+                pasarguard.update_install(ADMIN_DB, SERVER_CIPHER, user_id, ticket, draft)
                 try:
                     await panel.ensure_host(draft["remark"], node["address"], inbound, hosts)
                 except pasarguard.PanelError as error:
@@ -2075,7 +2113,7 @@ async def panel_button(update, context):
                     )
                 clear(context)
                 await message.reply_text(
-                    f"اینباند پیش‌فرض {value} ذخیره شد. Host نودهای جدید با IP نود و نام‌های HERM1، HERM2 و … ساخته می‌شوند.",
+                    f"اینباند پیش‌فرض {value} ذخیره شد. اسم Host هر نود هنگام ثبت ازت پرسیده می‌شود.",
                     reply_markup=panel_menu(),
                 )
             elif state["step"] == "host":
@@ -4787,7 +4825,10 @@ async def handle_text(update, context):
     if state.get("panel_install_step") in {"domain", "email", "confirm"}:
         await panel_install_text(update, context)
         return
-    if "pasarguard" in state and state["pasarguard"]["step"] == "credentials":
+    if state.get("pasarguard", {}).get("step") == "host_name":
+        await panel_host_name_text(update, context)
+        return
+    if state.get("pasarguard", {}).get("step") == "credentials":
         await panel_credentials_text(update, context)
         return
     if state.get("action") == "ssl" and "ssl_domain" not in state:
@@ -4967,7 +5008,7 @@ if __name__ == "__main__":
     add(CallbackQueryHandler(select, pattern=r"^(ssh|node|ssl|on|off|update)$"))
     add(CallbackQueryHandler(
         panel_button,
-        pattern=r"^(?:pg|pg:(?:key|default|hosts|(?:add|confirm):[a-f0-9]{24})|pgp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|confirm))$",
+        pattern=r"^(?:pg|pg:(?:key|default|hosts|(?:add|rename):[a-f0-9]{24}|confirm:[a-f0-9]{24}(?::[a-f0-9]{16})?)|pgp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|confirm))$",
     ))
     add(CallbackQueryHandler(
         cherry_button,
