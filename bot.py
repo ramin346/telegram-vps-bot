@@ -3088,7 +3088,7 @@ async def cf_record_menu(message, state, token, record_id):
     if row["type"] in cloudflare.HOST_TYPES:
         rows.append([("تغییر نام", "field:name"), ("تغییر مقصد", "field:content")])
         settings = []
-        if row.get("proxiable"):
+        if row["type"] != "NS" and row.get("proxiable"):
             settings.append(("تغییر Proxy", "field:proxied"))
         if not row.get("proxied"):
             settings.append(("تغییر TTL", "field:ttl"))
@@ -3097,9 +3097,10 @@ async def cf_record_menu(message, state, token, record_id):
     if row["type"] in {"A", "AAAA"}:
         rows.append([("🔁 تعویض خودکار IP", "rotate")])
     rows.extend([[("🗑 حذف رکورد", "delete")], [("بازگشت به DNS", "dns")]])
+    proxy = "" if row["type"] == "NS" else f"Proxy: {'روشن' if row.get('proxied') else 'خاموش'}\n"
     await message.reply_text(
         f"{row['name']} · {row['type']}\nمقصد: {str(row.get('content') or '—')[:1000]}\n"
-        f"Proxy: {'روشن' if row.get('proxied') else 'خاموش'}\nTTL: {cf_ttl_label(row.get('ttl'))}",
+        f"{proxy}TTL: {cf_ttl_label(row.get('ttl'))}",
         reply_markup=cf_keyboard(state, rows),
     )
 
@@ -3116,7 +3117,10 @@ async def cf_input(message, state, field):
             prompt = "نام ساب‌دامنه را بفرست، مثل app یا app.example.com."
         else:
             kind = state["form"]["type"] if state["mode"] == "create" else state["record"]["type"]
-            prompt = f"مقصد رکورد {kind} را بفرست."
+            prompt = (
+                "نام کامل Nameserver را بفرست، مثلاً ns1.example.net."
+                if kind == "NS" else f"مقصد رکورد {kind} را بفرست."
+            )
         await message.reply_text(prompt + " برای لغو /cancel را بزن.")
         return
     rows = (
@@ -3140,10 +3144,10 @@ async def cf_review(message, state):
     if row["name"] != current.get("name") and current:
         text += f"\nنام قبلی: {current['name']}"
     if mode != "delete":
-        text += (
-            f"\nمقصد: {row.get('content', '—')}\nProxy: {'روشن' if row.get('proxied') else 'خاموش'}"
-            f"\nTTL: {cf_ttl_label(row.get('ttl'))}"
-        )
+        text += f"\nمقصد: {row.get('content', '—')}"
+        if row["type"] != "NS":
+            text += f"\nProxy: {'روشن' if row.get('proxied') else 'خاموش'}"
+        text += f"\nTTL: {cf_ttl_label(row.get('ttl'))}"
     await message.reply_text(
         text, reply_markup=cf_keyboard(state, [[("تأیید", "confirm"), ("انصراف", "dns")]]),
     )
@@ -3384,7 +3388,8 @@ async def cloudflare_text(update, context):
     if state["mode"] == "edit":
         await cf_review(message, state)
     else:
-        await cf_input(message, state, "content" if step == "name" else "proxied")
+        next_step = "content" if step == "name" else "ttl" if state["form"]["type"] == "NS" else "proxied"
+        await cf_input(message, state, next_step)
 
 
 async def backup_button(update, context):
@@ -5074,7 +5079,7 @@ if __name__ == "__main__":
     ))
     add(CallbackQueryHandler(
         cloudflare_button,
-        pattern=r"^(?:cloudflare|cf:(?:key|zones|add)|cp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|accounts|replace|zones|list|edit_list|search|dns|add|type:(?:A|AAAA|CNAME)|field:(?:name|content|proxied|ttl)|proxy:(?:on|off)|ttl:(?:1|60|300|600|1800|3600)|delete|confirm|rotate|rot_(?:next|review|confirm|list|refresh|now|cancel|delete|remove|replace|page:[0-9]{1,8})))$",
+        pattern=r"^(?:cloudflare|cf:(?:key|zones|add)|cp:[a-f0-9]{16}:(?:(?:pick|page):[0-9]{1,8}|accounts|replace|zones|list|edit_list|search|dns|add|type:(?:A|AAAA|CNAME|NS)|field:(?:name|content|proxied|ttl)|proxy:(?:on|off)|ttl:(?:1|60|300|600|1800|3600)|delete|confirm|rotate|rot_(?:next|review|confirm|list|refresh|now|cancel|delete|remove|replace|page:[0-9]{1,8})))$",
     ))
     add(CallbackQueryHandler(
         hetzner_button,

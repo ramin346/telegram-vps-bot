@@ -5,7 +5,7 @@ from urllib.parse import quote
 import httpx
 
 BASE_URL = "https://api.cloudflare.com/client/v4"
-HOST_TYPES = ("A", "AAAA", "CNAME")
+HOST_TYPES = ("A", "AAAA", "CNAME", "NS")
 TTL_VALUES = (1, 60, 300, 600, 1800, 3600)
 
 
@@ -105,9 +105,9 @@ def subdomain(value, zone):
 
 
 def destination(value, kind):
-    if kind == "CNAME":
+    if kind in {"CNAME", "NS"}:
         name = domain(value)
-        if "." not in name:
+        if "." not in name or (kind == "NS" and name.rsplit(".", 1)[1].isdigit()):
             raise ValueError()
         return name
     address = ip_address(value)
